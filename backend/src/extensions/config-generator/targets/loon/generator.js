@@ -18,7 +18,7 @@ import {
     remoteProxySourceWarning,
 } from '@/extensions/config-generator/core/remote-proxy-source';
 import { resolveRuleSetSource } from '@/extensions/config-generator/core/rule-set-source-resolver';
-import { resolveRuleBindingName } from '@/extensions/config-generator/core/rule-binding-name';
+import { getExplicitRuleBindingName } from '@/extensions/config-generator/core/rule-binding-name';
 import { mergeNamedLines } from '@/extensions/config-generator/core/named-entry-merge';
 import { separateSectionBlocks } from '@/extensions/config-generator/core/section-lines';
 import {
@@ -587,7 +587,7 @@ function generateRules(project, ruleSets, warnings) {
                 `# ==================== ${rule.policy} ====================`,
             );
         }
-        const bindingName = resolveRuleBindingName(rule, ruleSet);
+        const bindingName = getExplicitRuleBindingName(rule);
         if (bindingName) currentRemoteBlock.push(`# ${bindingName}`);
         currentRemoteBlock.push(
             `${resolution.url}, policy=${rule.policy}, enabled=true`,

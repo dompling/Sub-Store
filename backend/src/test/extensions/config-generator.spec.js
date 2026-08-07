@@ -80,6 +80,41 @@ function createResponse(path) {
     };
 }
 
+function createUnnamedRemoteRuleFixture() {
+    const project = {
+        name: 'unnamed-remote-rule',
+        remoteProxySources: [],
+        groups: [],
+        rules: [
+            {
+                kind: 'remote',
+                ruleSet: 'internal-rule-set-id',
+                policy: 'REJECT',
+            },
+        ],
+        outputs: { surge: {}, qx: {}, clash: {}, loon: {} },
+    };
+    const ruleSets = [
+        {
+            name: 'internal-rule-set-id',
+            source: {
+                kind: 'url',
+                url: 'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/Advertising/Advertising.list',
+                target: 'surge',
+            },
+        },
+    ];
+    return {
+        project,
+        ruleSets,
+        input: {
+            project,
+            ruleSets,
+            produceBuiltinArtifact: async () => '',
+        },
+    };
+}
+
 describe('config generator Surge extension', function () {
     const originalRead = $.read.bind($);
     const originalWrite = $.write.bind($);
@@ -910,6 +945,55 @@ describe('config generator Surge extension', function () {
             'RULE-SET, https://rules.example.com/ads.list, REJECT',
         );
         expect(surge.body).to.not.contain('Advertising');
+    });
+
+    it('allocates an internal Quantumult X resource tag when the rule name is omitted', async function () {
+        const { input } = createUnnamedRemoteRuleFixture();
+        const qx = await generateQXConfig(input);
+        expect(qx.body).to.contain('tag=internal-rule-set-id');
+    });
+
+    it('allocates an internal Clash provider key when the rule name is omitted', async function () {
+        const { input } = createUnnamedRemoteRuleFixture();
+        const clash = YAML.safeLoad((await generateClashConfig(input)).body);
+
+        expect(clash['rule-providers']).to.have.property(
+            'internal-rule-set-id',
+        );
+        expect(clash.rules).to.include('RULE-SET,internal-rule-set-id,REJECT');
+    });
+
+    it('does not expose the internal rule-set id in unnamed Loon output', async function () {
+        const { input } = createUnnamedRemoteRuleFixture();
+        const loon = await generateLoonConfig(input);
+
+        expect(loon.body).to.not.contain('internal-rule-set-id');
+        expect(loon.body).to.contain(
+            'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Loon/Advertising/Advertising.list, policy=REJECT, enabled=true',
+        );
+    });
+
+    it('does not expose the internal rule-set id in unnamed Surge output', async function () {
+        const { input } = createUnnamedRemoteRuleFixture();
+        const surge = await generateSurgeConfig(input);
+
+        expect(surge.body).to.not.contain('internal-rule-set-id');
+        expect(surge.body).to.contain(
+            'RULE-SET, https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Surge/Advertising/Advertising.list, REJECT',
+        );
+    });
+
+    it('does not mutate unnamed rules or rule sets while previewing every target', async function () {
+        const { project, ruleSets, input } = createUnnamedRemoteRuleFixture();
+        const original = JSON.parse(JSON.stringify({ project, ruleSets }));
+
+        await generateSurgeConfig(input);
+        await generateQXConfig(input);
+        await generateClashConfig(input);
+        await generateLoonConfig(input);
+
+        expect({ project, ruleSets }).to.deep.equal(original);
+        expect(project.rules[0]).to.not.have.property('name');
     });
 
     it('separates generated policy groups with blank lines for readable previews', async function () {
@@ -4540,6 +4624,9 @@ describe('config generator Surge extension', function () {
         expect(result.body).to.contain(
             'https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Loon/Advertising/Advertising.list, policy=REJECT, enabled=true',
         );
+        expect(result.body).to.contain(
+            '# Advertising\nhttps://raw.githubusercontent.com/blackmatrix7/ios_rule_script/master/rule/Loon/Advertising/Advertising.list',
+        );
         expect(result.body).to.contain('FINAL, Proxy');
         expect(
             result.warnings.some((warning) =>
@@ -4856,6 +4943,87 @@ describe('config generator Surge extension', function () {
                 ).to.deep.equal(['surge', 'qx', 'clash', 'loon']);
             },
         );
+    });
+
+    it('persists a cleared RULE-SET name across project update and reload', async function () {
+        const state = {
+            [CONFIG_GENERATOR_KEY]: {
+                version: 1,
+                projects: [
+                    {
+                        name: 'main',
+                        revision: 1,
+                        groups: [],
+                        remoteProxySources: [],
+                        rules: [
+                            {
+                                kind: 'remote',
+                                name: 'Advertising',
+                                ruleSet: 'ads',
+                                policy: 'REJECT',
+                            },
+                        ],
+                        outputs: { surge: {} },
+                    },
+                ],
+                ruleSets: [
+                    {
+                        name: 'ads',
+                        source: {
+                            kind: 'url',
+                            url: 'https://rules.example.com/ads.list',
+                            target: 'surge',
+                        },
+                    },
+                ],
+            },
+        };
+        $.read = (key) => state[key] || [];
+        $.write = (value, key) => {
+            state[key] = value;
+        };
+        const { app, handlers } = createRouteApp();
+        registerConfigGeneratorRoutes(app, {
+            produceBuiltinArtifact: async () => '',
+        });
+
+        const update = createResponse(
+            '/api/extensions/config-generator/project/:name',
+        );
+        await handlers.get(
+            'PATCH /api/extensions/config-generator/project/:name',
+        )(
+            {
+                params: { name: 'main' },
+                body: {
+                    rules: [
+                        {
+                            kind: 'remote',
+                            ruleSet: 'ads',
+                            policy: 'REJECT',
+                        },
+                    ],
+                },
+            },
+            update,
+        );
+
+        expect(update.statusCode).to.equal(200);
+        expect(update.body.data.rules[0]).to.not.have.property('name');
+
+        const reload = createResponse(
+            '/api/extensions/config-generator/project/:name',
+        );
+        await handlers.get(
+            'GET /api/extensions/config-generator/project/:name',
+        )({ params: { name: 'main' } }, reload);
+
+        expect(reload.statusCode).to.equal(200);
+        expect(reload.body.data.rules[0]).to.deep.equal({
+            kind: 'remote',
+            ruleSet: 'ads',
+            policy: 'REJECT',
+        });
     });
 
     it('converts an automatic URL source through the builtin subscription pipeline', async function () {

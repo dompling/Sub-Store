@@ -15,7 +15,7 @@ import {
     remoteProxySourceWarning,
 } from '@/extensions/config-generator/core/remote-proxy-source';
 import { resolveRuleSetSource } from '@/extensions/config-generator/core/rule-set-source-resolver';
-import { resolveRuleBindingName } from '@/extensions/config-generator/core/rule-binding-name';
+import { resolveRuleBindingResourceName } from '@/extensions/config-generator/core/rule-binding-name';
 import { mergeNamedEntries } from '@/extensions/config-generator/core/named-entry-merge';
 import { parseSurgeCsv } from '@/extensions/config-generator/targets/surge/serializer';
 
@@ -625,7 +625,7 @@ async function generateRules(project, ruleSets, warnings, downloadRuleSet) {
         let providerName = providersByRuleSet.get(ruleSet.name);
         if (!providerName) {
             providerName = allocateUnique(
-                resolveRuleBindingName(rule, ruleSet),
+                resolveRuleBindingResourceName(rule, ruleSet),
                 usedProviderNames,
                 'rule-provider',
             );

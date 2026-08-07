@@ -1,5 +1,15 @@
+export function getExplicitRuleBindingName(rule) {
+    return typeof rule?.name === 'string' ? rule.name.trim() : '';
+}
+
+export function resolveRuleBindingResourceName(rule, ruleSet) {
+    return getExplicitRuleBindingName(rule) || `${ruleSet?.name || ''}`.trim();
+}
+
+// Preserve the original export for external extensions while keeping its
+// resource-allocation semantics explicit inside the built-in generators.
 export function resolveRuleBindingName(rule, ruleSet) {
-    return `${rule?.name || ruleSet?.name || ''}`.trim();
+    return resolveRuleBindingResourceName(rule, ruleSet);
 }
 
 export function inferRuleBindingName(source, fallback = '') {

@@ -16,7 +16,7 @@ import {
     projectIncludedPolicyGroups,
 } from '@/extensions/config-generator/core/policy-group-projection';
 import { resolveRuleSetSource } from '@/extensions/config-generator/core/rule-set-source-resolver';
-import { resolveRuleBindingName } from '@/extensions/config-generator/core/rule-binding-name';
+import { resolveRuleBindingResourceName } from '@/extensions/config-generator/core/rule-binding-name';
 import { separateSectionBlocks } from '@/extensions/config-generator/core/section-lines';
 import { mergeNamedLines } from '@/extensions/config-generator/core/named-entry-merge';
 import {
@@ -380,7 +380,7 @@ function remoteRules(project, ruleSets, warnings) {
             });
         }
         if (resolution.kind === 'qx-inserted') {
-            const name = resolveRuleBindingName(rule, ruleSet);
+            const name = resolveRuleBindingResourceName(rule, ruleSet);
             return [
                 [
                     resolution.value,
@@ -392,7 +392,7 @@ function remoteRules(project, ruleSets, warnings) {
             ];
         }
         if (resolution.kind !== 'remote-url' || !resolution.url) return [];
-        const name = resolveRuleBindingName(rule, ruleSet);
+        const name = resolveRuleBindingResourceName(rule, ruleSet);
         const values = [
             resolution.url,
             `tag=${name}`,
