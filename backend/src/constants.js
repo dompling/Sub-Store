@@ -5,6 +5,7 @@ export const COLLECTIONS_KEY = 'collections';
 export const FILES_KEY = 'files';
 export const MODULES_KEY = 'modules';
 export const ARTIFACTS_KEY = 'artifacts';
+export const CONFIG_GENERATOR_KEY = 'configGenerator';
 export const RULES_KEY = 'rules';
 export const TOKENS_KEY = 'tokens';
 export const ARCHIVES_KEY = 'archives';

@@ -1,5 +1,4 @@
 import { Base64 } from 'js-base64';
-import _ from 'lodash';
 import express from '@/vendor/express';
 import $ from '@/core/app';
 import migrate from '@/utils/migration';
@@ -7,6 +6,7 @@ import download, { downloadFile } from '@/utils/download';
 import {
     syncArtifacts,
     produceArtifact,
+    produceBuiltinArtifact,
     syncArtifactItem,
 } from '@/restful/sync';
 import { gistBackupAction } from '@/restful/miscs';
@@ -33,6 +33,8 @@ import registerLogRoutes from './logs';
 import registerAgeRoutes from './age';
 import { consumeShareToken } from './token';
 import { AGE_PUBLIC_KEY } from '@/utils/age';
+import { registerExtensionRoutes } from '@/extensions/registry';
+import '@/extensions/config-generator';
 
 export default function serve() {
     let port;
@@ -118,6 +120,9 @@ export default function serve() {
     // register routes
     registerCollectionRoutes($app);
     registerSubscriptionRoutes($app);
+    // Extensions may expose download URLs that are more specific than the
+    // generic subscription routes below, so register them first.
+    registerExtensionRoutes($app, { produceBuiltinArtifact });
     registerDownloadRoutes($app);
     registerPreviewRoutes($app);
     registerSortingRoutes($app);

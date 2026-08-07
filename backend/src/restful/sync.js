@@ -33,6 +33,8 @@ import { normalizeClashYaml } from '@/core/proxy-utils/preprocessors';
 import { applyAgeOutputEncryption } from '@/restful/age-output';
 import { maskAgeSecretInUrl } from '@/utils/age';
 import { isMihomoConfigFile, normalizeFileConfig } from '@/utils/file-type';
+import { getArtifactSourceAdapter } from '@/extensions/registry';
+import '@/extensions/config-generator';
 
 export default function register($app) {
     // Initialization
@@ -243,15 +245,10 @@ async function prepareMihomoProfileContent(file, sourceOptions = {}) {
         if (proxies.length === 0) {
             throw new Error(`文件 ${file.name} 中不含有效节点`);
         }
-        config.proxies = ProxyUtils.produce(
-            proxies,
-            'mihomo',
-            'internal',
-            {
-                'delete-underscore-fields': true,
-                'include-unsupported-proxy': file?.includeUnsupportedProxy,
-            },
-        );
+        config.proxies = ProxyUtils.produce(proxies, 'mihomo', 'internal', {
+            'delete-underscore-fields': true,
+            'include-unsupported-proxy': file?.includeUnsupportedProxy,
+        });
     } else {
         config.proxies = await produceArtifact({
             type: sourceType,
@@ -268,7 +265,7 @@ async function prepareMihomoProfileContent(file, sourceOptions = {}) {
     return ProxyUtils.yaml.safeDump(config);
 }
 
-async function produceArtifact({
+async function produceBuiltinArtifact({
     type,
     name,
     platform,
@@ -290,6 +287,16 @@ async function produceArtifact({
     all,
 }) {
     platform = platform || 'JSON';
+
+    if (
+        !['subscription', 'sub', 'collection', 'col', 'rule', 'file'].includes(
+            type,
+        )
+    ) {
+        const error = new Error(`Unsupported builtin artifact type: ${type}`);
+        error.code = 'UNSUPPORTED_BUILTIN_ARTIFACT_TYPE';
+        throw error;
+    }
 
     if (['subscription', 'sub'].includes(type)) {
         let sub;
@@ -340,7 +347,9 @@ async function produceArtifact({
                             } catch (err) {
                                 errors[url] = err;
                                 $.error(
-                                    `订阅 ${sub.name} 的远程订阅 ${maskAgeSecretInUrl(
+                                    `订阅 ${
+                                        sub.name
+                                    } 的远程订阅 ${maskAgeSecretInUrl(
                                         url,
                                     )} 发生错误: ${err}`,
                                 );
@@ -405,7 +414,9 @@ async function produceArtifact({
                             } catch (err) {
                                 errors[url] = err;
                                 $.error(
-                                    `订阅 ${sub.name} 的远程订阅 ${maskAgeSecretInUrl(
+                                    `订阅 ${
+                                        sub.name
+                                    } 的远程订阅 ${maskAgeSecretInUrl(
                                         url,
                                     )} 发生错误: ${err}`,
                                 );
@@ -443,7 +454,9 @@ async function produceArtifact({
                 }
             }
             if (produceType === 'raw') {
-                return JSON.stringify((Array.isArray(raw) ? raw : [raw]).flat());
+                return JSON.stringify(
+                    (Array.isArray(raw) ? raw : [raw]).flat(),
+                );
             }
             // parse proxies
             let proxies = (Array.isArray(raw) ? raw : [raw])
@@ -492,7 +505,9 @@ async function produceArtifact({
                 produceOpts,
             );
         } catch (err) {
-            if (!shouldFallbackIgnoreFailedRemoteSub(subIgnoreFailedRemoteSub)) {
+            if (
+                !shouldFallbackIgnoreFailedRemoteSub(subIgnoreFailedRemoteSub)
+            ) {
                 throw err;
             }
 
@@ -536,10 +551,11 @@ async function produceArtifact({
                 }
             });
         }
-        const collectionIgnoreFailedRemoteSub = resolveIgnoreFailedRemoteSubMode(
-            ignoreFailedRemoteSub,
-            collection.ignoreFailedRemoteSub,
-        );
+        const collectionIgnoreFailedRemoteSub =
+            resolveIgnoreFailedRemoteSubMode(
+                ignoreFailedRemoteSub,
+                collection.ignoreFailedRemoteSub,
+            );
         const skipFlow = noFlow || collection.noFlow;
 
         try {
@@ -696,7 +712,9 @@ async function produceArtifact({
                                 },
                             });
                             $.error(
-                                `订阅 ${sub.name} 在组合订阅处理中启用兜底后返回空结果: ${
+                                `订阅 ${
+                                    sub.name
+                                } 在组合订阅处理中启用兜底后返回空结果: ${
                                     err.message ?? err
                                 }`,
                             );
@@ -719,9 +737,11 @@ async function produceArtifact({
             );
 
             if (Object.keys(errors).length > 0) {
-                const message = `组合订阅 ${collection.name} 的子订阅 ${Object.keys(
-                    errors,
-                ).join(', ')} 发生错误, 请查看日志`;
+                const message = `组合订阅 ${
+                    collection.name
+                } 的子订阅 ${Object.keys(errors).join(
+                    ', ',
+                )} 发生错误, 请查看日志`;
                 const notify = () => {
                     $.notify(
                         `🌍 Sub-Store 处理组合订阅失败`,
@@ -924,6 +944,26 @@ async function produceArtifact({
     }
 }
 
+async function produceArtifact(input) {
+    if (
+        ['subscription', 'sub', 'collection', 'col', 'rule', 'file'].includes(
+            input.type,
+        )
+    ) {
+        return produceBuiltinArtifact(input);
+    }
+    const adapter = getArtifactSourceAdapter(input.type);
+    if (!adapter) {
+        const error = new Error(`Unsupported artifact type: ${input.type}`);
+        error.code = 'UNSUPPORTED_ARTIFACT_TYPE';
+        throw error;
+    }
+    return adapter.produce({
+        ...input,
+        produceBuiltinArtifact,
+    });
+}
+
 function createArtifactUploadBatches(names, batchSize) {
     const batches = [];
     for (let index = 0; index < names.length; index += batchSize) {
@@ -989,6 +1029,11 @@ function findArtifactSourceConfig(artifact) {
     }
     if (artifact.type === 'file') {
         return findByName($.read(FILES_KEY), artifact.source);
+    }
+
+    const adapter = getArtifactSourceAdapter(artifact.type);
+    if (adapter?.findSourceConfig) {
+        return adapter.findSourceConfig(artifact.source);
     }
 
     return null;
@@ -1216,9 +1261,7 @@ async function syncArtifacts(options = {}) {
                     $.error(
                         `生成同步配置 ${formatArtifactLogName(
                             artifact,
-                        )} 发生错误: ${
-                            e.message ?? e
-                        }`,
+                        )} 发生错误: ${e.message ?? e}`,
                     );
                     invalid.push(artifact.name);
                 }
@@ -1408,6 +1451,7 @@ export {
     markArtifactProducedWithoutUpload,
     prepareMihomoProfileContent,
     produceArtifact,
+    produceBuiltinArtifact,
     produceSyncArtifactOutput,
     resolveFileRawContent,
     shouldUploadArtifact,

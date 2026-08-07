@@ -16,6 +16,8 @@ import { InternalServerError, RequestInvalidError } from '@/restful/errors';
 import Gist from '@/utils/gist';
 import migrate from '@/utils/migration';
 import env from '@/utils/env';
+import { listExtensionFeatures } from '@/extensions/registry';
+import '@/extensions/config-generator';
 import { formatDateTime } from '@/utils';
 import {
     AGE_SECRET_KEY,
@@ -26,8 +28,7 @@ import {
 } from '@/utils/age';
 
 const GIST_TOKEN_PATH = 'settings.gistToken';
-const GIST_DOWNLOAD_TOKEN_STRATEGY_PATH =
-    'settings.gistDownloadTokenStrategy';
+const GIST_DOWNLOAD_TOKEN_STRATEGY_PATH = 'settings.gistDownloadTokenStrategy';
 
 export default function register($app) {
     // utils
@@ -126,6 +127,7 @@ export default function register($app) {
 function getEnv(req, res) {
     env.feature = env.feature || {};
     env.feature.archive = true;
+    Object.assign(env.feature, listExtensionFeatures());
     if (req.query.share) {
         env.feature.share = true;
     }
@@ -215,11 +217,7 @@ async function decryptGistBackupContent(content, settings, encoding) {
     return decryptArmorIfPresent(content, ageSecretKey);
 }
 
-function resolveGistDownloadTokenStrategy(
-    storedStrategy,
-    queryStrategy,
-    keep,
-) {
+function resolveGistDownloadTokenStrategy(storedStrategy, queryStrategy, keep) {
     if (queryStrategy !== undefined) {
         if (queryStrategy !== 'overwrite' && queryStrategy !== 'keep') {
             throw new RequestInvalidError(
@@ -363,10 +361,7 @@ async function gistBackupAction(
             const tokenPathIndex = keepPaths.indexOf(GIST_TOKEN_PATH);
             if (tokenStrategy === 'keep' && tokenPathIndex === -1) {
                 keepPaths.push(GIST_TOKEN_PATH);
-            } else if (
-                tokenStrategy === 'overwrite' &&
-                tokenPathIndex !== -1
-            ) {
+            } else if (tokenStrategy === 'overwrite' && tokenPathIndex !== -1) {
                 keepPaths.splice(tokenPathIndex, 1);
             }
             if (!keepPaths.includes(GIST_DOWNLOAD_TOKEN_STRATEGY_PATH)) {
