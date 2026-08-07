@@ -6,6 +6,13 @@ export const FILES_KEY = 'files';
 export const MODULES_KEY = 'modules';
 export const ARTIFACTS_KEY = 'artifacts';
 export const CONFIG_GENERATOR_KEY = 'configGenerator';
+// Extension Host state lives in the root/global store so that Node and
+// script-product invocations share the lifecycle revision and receipts.
+// Keep these keys namespaced and versioned; they are intentionally separate
+// from extension-owned business data.
+export const EXTENSIONS_KEY = '#sub-store-extensions';
+export const EXTENSION_CATALOG_KEY = '#sub-store-extension-catalog';
+export const EXTENSION_TASKS_KEY = '#sub-store-extension-tasks';
 export const RULES_KEY = 'rules';
 export const TOKENS_KEY = 'tokens';
 export const ARCHIVES_KEY = 'archives';

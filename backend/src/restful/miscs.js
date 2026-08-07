@@ -17,7 +17,7 @@ import Gist from '@/utils/gist';
 import migrate from '@/utils/migration';
 import env from '@/utils/env';
 import { listExtensionFeatures } from '@/extensions/registry';
-import '@/extensions/config-generator';
+import '@/extensions/bundled';
 import { formatDateTime } from '@/utils';
 import {
     AGE_SECRET_KEY,

@@ -26,22 +26,41 @@ import registerArchiveRoutes from '@/restful/archives';
 import registerModuleRoutes from '@/restful/module';
 import registerLogRoutes from '@/restful/logs';
 import registerAgeRoutes from '@/restful/age';
+import registerExtensionControlRoutes from '@/restful/extensions';
+import { registerExtensionRoutes } from '@/extensions/registry';
+import { initializeExtensionHost } from '@/extensions/host';
+import { loadBundledExtensions } from '@/extensions/bundled';
+import { createConfigHostingRouteApps } from '@/extensions/config-hosting';
 
 migrate();
 serve();
 
 function serve() {
     const $app = express({ substore: $ });
+    const { manager: extensionManager } = initializeExtensionHost();
+    loadBundledExtensions(extensionManager);
 
     // register routes
+    registerExtensionRoutes($app, {
+        extensionManager,
+        executionLane: 'simple',
+    });
+    registerExtensionControlRoutes($app, extensionManager);
+    const configHostingApps = createConfigHostingRouteApps(
+        $app,
+        extensionManager,
+        'simple',
+    );
     registerCollectionRoutes($app);
     registerSubscriptionRoutes($app);
     registerTokenRoutes($app);
     registerFileRoutes($app);
     registerModuleRoutes($app);
-    registerArtifactRoutes($app);
+    registerArtifactRoutes(configHostingApps.legacy);
+    registerArtifactRoutes(configHostingApps.canonical);
     registerSettingRoutes($app);
-    registerSortRoutes($app);
+    registerSortRoutes(configHostingApps.legacy);
+    registerSortRoutes(configHostingApps.canonical);
     registerArchiveRoutes($app);
     registerMiscRoutes($app);
     registerLogRoutes($app);

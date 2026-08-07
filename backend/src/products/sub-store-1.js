@@ -8,8 +8,12 @@ import express from '@/vendor/express';
 import $ from '@/core/app';
 import registerDownloadRoutes from '@/restful/download';
 import registerPreviewRoutes from '@/restful/preview';
-import registerSyncRoutes from '@/restful/sync';
+import registerSyncRoutes, { produceBuiltinArtifact } from '@/restful/sync';
 import registerNodeInfoRoutes from '@/restful/node-info';
+import { registerExtensionRoutes } from '@/extensions/registry';
+import { initializeExtensionHost } from '@/extensions/host';
+import { loadBundledExtensions } from '@/extensions/bundled';
+import { createConfigHostingRouteApps } from '@/extensions/config-hosting';
 
 console.log(
     `
@@ -24,11 +28,24 @@ serve();
 
 function serve() {
     const $app = express({ substore: $ });
+    const { manager: extensionManager } = initializeExtensionHost();
+    loadBundledExtensions(extensionManager);
 
     // register routes
+    registerExtensionRoutes($app, {
+        extensionManager,
+        executionLane: 'parser',
+        produceBuiltinArtifact,
+    });
+    const configHostingApps = createConfigHostingRouteApps(
+        $app,
+        extensionManager,
+        'parser',
+    );
     registerDownloadRoutes($app);
     registerPreviewRoutes($app);
-    registerSyncRoutes($app);
+    registerSyncRoutes(configHostingApps.legacy);
+    registerSyncRoutes(configHostingApps.canonical);
     registerNodeInfoRoutes($app);
 
     $app.options('/', (req, res) => {

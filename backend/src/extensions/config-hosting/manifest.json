@@ -1,0 +1,171 @@
+{
+    "schemaVersion": 1,
+    "id": "org.substore.config-hosting",
+    "kind": "trusted-official",
+    "distribution": "store",
+    "name": "配置托管",
+    "description": "托管、发布和同步生成的代理配置",
+    "version": "1.0.0",
+    "publisher": {
+        "id": "org.substore",
+        "name": "Sub-Store",
+        "verified": true
+    },
+    "license": "GPL-3.0",
+    "homepage": "https://github.com/sub-store-org/Sub-Store",
+    "trust": {
+        "level": "official-root",
+        "allowedPublisher": "org.substore",
+        "allowlistedId": true
+    },
+    "host": {
+        "apiVersion": "1.0.0",
+        "frontendApiVersion": "1.0.0",
+        "implementationAbi": "config-hosting@1",
+        "runtimes": [
+            "node",
+            "qx",
+            "loon",
+            "surge",
+            "stash",
+            "shadowrocket",
+            "egern"
+        ]
+    },
+    "frontend": {
+        "entrypoint": "frontend/index.mjs",
+        "style": "frontend/style.css",
+        "sdkSpecifier": "@substore/frontend-sdk/v1",
+        "uiKitAbi": "substore-ui-kit@1",
+        "implementationAbi": "config-hosting-ui@1"
+    },
+    "variants": {
+        "node": {
+            "delivery": "trusted-package",
+            "packageKind": "local-official-receipt",
+            "implementationId": "org.substore.config-hosting@1/node",
+            "implementationAbi": "config-hosting@1",
+            "frontendAssetId": "org.substore.config-hosting-ui@1",
+            "entrypoint": "backend/index.cjs",
+            "containsExecutableCode": true
+        },
+        "qx": {
+            "delivery": "embedded-receipt",
+            "implementationId": "org.substore.config-hosting@1/qx",
+            "implementationAbi": "config-hosting@1",
+            "frontendAssetId": "org.substore.config-hosting-ui@1",
+            "containsExecutableCode": false,
+            "scheduledCommand": "org.substore.config-hosting.sync-all"
+        },
+        "loon": {
+            "delivery": "embedded-receipt",
+            "implementationId": "org.substore.config-hosting@1/loon",
+            "implementationAbi": "config-hosting@1",
+            "frontendAssetId": "org.substore.config-hosting-ui@1",
+            "containsExecutableCode": false,
+            "scheduledCommand": "org.substore.config-hosting.sync-all"
+        },
+        "surge": {
+            "delivery": "embedded-receipt",
+            "implementationId": "org.substore.config-hosting@1/surge",
+            "implementationAbi": "config-hosting@1",
+            "frontendAssetId": "org.substore.config-hosting-ui@1",
+            "containsExecutableCode": false,
+            "scheduledCommand": "org.substore.config-hosting.sync-all"
+        },
+        "default-script-runtime": {
+            "delivery": "embedded-receipt",
+            "implementationId": "org.substore.config-hosting@1/script",
+            "implementationAbi": "config-hosting@1",
+            "frontendAssetId": "org.substore.config-hosting-ui@1",
+            "containsExecutableCode": false
+        }
+    },
+    "requires": {
+        "hard": [
+            "resource-producer@1",
+            "artifact-source-registry@1",
+            "reference-graph@1",
+            "generation-storage@1",
+            "route-gateway@1"
+        ],
+        "optional": [
+            "publisher.github-gist@1",
+            "publisher.gitlab-snippet@1",
+            "scheduler.cron@1",
+            "crypto.age@1",
+            "archive@1",
+            "backup@1"
+        ]
+    },
+    "permissions": [
+        "storage.own",
+        "resources.list",
+        "resources.read",
+        "resources.produce",
+        "references.manage-own",
+        "publishers.use",
+        "credentials.use-handle",
+        "scheduler.jobs",
+        "crypto.age.encrypt",
+        "archive.contribute",
+        "backup.contribute",
+        "settings.contribute",
+        "routes.namespaced",
+        "routes.legacy-alias",
+        "navigation.register",
+        "commands.register"
+    ],
+    "contributes": {
+        "routes": [
+            "org.substore.config-hosting.list",
+            "org.substore.config-hosting.edit",
+            "org.substore.config-hosting.sync",
+            "org.substore.config-hosting.remote-index"
+        ],
+        "navigation": ["org.substore.config-hosting.main"],
+        "commands": [
+            "org.substore.config-hosting.create",
+            "org.substore.config-hosting.refresh",
+            "org.substore.config-hosting.sync-all",
+            "org.substore.config-hosting.restore-remote-index",
+            "org.substore.config-hosting.open-repository"
+        ],
+        "settings": ["org.substore.config-hosting.defaults"],
+        "scheduledCommands": ["org.substore.config-hosting.sync-all"],
+        "archiveTypes": ["org.substore.config-hosting.artifact"]
+    },
+    "scriptExecutionLanes": {
+        "simple": {
+            "product": "sub-store-0",
+            "implementationId": "org.substore.config-hosting@1/simple",
+            "routes": [
+                "runtime/artifacts",
+                "runtime/artifacts/:id",
+                "runtime/remote-index/restore",
+                "runtime/sort",
+                "runtime/settings"
+            ]
+        },
+        "parser": {
+            "product": "sub-store-1",
+            "implementationId": "org.substore.config-hosting@1/parser",
+            "routes": [
+                "runtime/sync",
+                "runtime/sync/:id",
+                "runtime/preview",
+                "runtime/produce",
+                "runtime/download"
+            ]
+        },
+        "scheduled": {
+            "product": "cron-sync-artifacts",
+            "implementationId": "org.substore.config-hosting@1/scheduled",
+            "commands": ["org.substore.config-hosting.sync-all"]
+        }
+    },
+    "storage": {
+        "schemaVersion": 1,
+        "legacyKeys": ["artifacts"]
+    }
+}

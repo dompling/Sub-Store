@@ -1,0 +1,23 @@
+{
+    "schemaVersion": 1,
+    "extensionId": "org.substore.config-hosting",
+    "releaseChannel": "stable",
+    "publisher": {
+        "id": "org.substore",
+        "name": "Sub-Store",
+        "verified": true
+    },
+    "packageKind": "local-official-receipt",
+    "signature": {
+        "algorithm": "sha256-digest",
+        "keyId": "substore-development-root"
+    },
+    "variants": ["node", "qx", "loon", "surge", "default-script-runtime"],
+    "implementationAbi": "config-hosting@1",
+    "frontendImplementationAbi": "config-hosting-ui@1",
+    "payload": {
+        "kind": "manifest-projection",
+        "containsExecutableCode": false,
+        "containsInstallHook": false
+    }
+}

@@ -67,13 +67,9 @@ function restoreArchiveEntry(req, res) {
             mappedError instanceof ResourceNotFoundError
                 ? 404
                 : mappedError instanceof RequestInvalidError
-                  ? 400
-                  : 500;
-        failed(
-            res,
-            mappedError,
-            statusCode,
-        );
+                ? 400
+                : 500;
+        failed(res, mappedError, statusCode);
     }
 }
 
@@ -87,7 +83,9 @@ function restoreArchivedEntry(entry) {
         case 'file':
             return createFileItem(snapshot);
         case 'artifact':
-            return createArtifactItem(normalizeArtifactSnapshotForRestore(snapshot));
+            return createArtifactItem(
+                normalizeArtifactSnapshotForRestore(snapshot),
+            );
         case 'share':
             return createTokenItem(snapshot, {
                 mode: snapshot.mode,

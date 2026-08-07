@@ -34,7 +34,7 @@ import { applyAgeOutputEncryption } from '@/restful/age-output';
 import { maskAgeSecretInUrl } from '@/utils/age';
 import { isMihomoConfigFile, normalizeFileConfig } from '@/utils/file-type';
 import { getArtifactSourceAdapter } from '@/extensions/registry';
-import '@/extensions/config-generator';
+import '@/extensions/bundled';
 
 export default function register($app) {
     // Initialization

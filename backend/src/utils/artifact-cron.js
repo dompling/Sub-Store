@@ -5,6 +5,7 @@ import { RequestInvalidError } from '@/restful/errors';
 const artifactCronJobs = new Map();
 const runningArtifactCronNames = new Set();
 let syncArtifactByName;
+let artifactCronEnabled = false;
 
 function getArtifactCron(artifact) {
     const cron = artifact?.cron == null ? '' : `${artifact.cron}`.trim();
@@ -64,6 +65,7 @@ function normalizeArtifactCron(artifact) {
 }
 
 function stopArtifactCronJobs() {
+    artifactCronEnabled = false;
     artifactCronJobs.forEach((job) => job.stop());
     artifactCronJobs.clear();
 }
@@ -82,9 +84,7 @@ async function runArtifactCron(name, logName, cron) {
         await syncArtifactByName(name);
         $.info(`[ARTIFACT CRON] ${logName} ${cron} finished`);
     } catch (e) {
-        $.error(
-            `[ARTIFACT CRON] ${logName} ${cron} error: ${e.message ?? e}`,
-        );
+        $.error(`[ARTIFACT CRON] ${logName} ${cron} error: ${e.message ?? e}`);
     } finally {
         runningArtifactCronNames.delete(name);
     }
@@ -117,7 +117,7 @@ function scheduleArtifactCron(artifact) {
 }
 
 function refreshArtifactCronJobs() {
-    if (!$.env.isNode || !syncArtifactByName) return;
+    if (!$.env.isNode || !syncArtifactByName || !artifactCronEnabled) return;
 
     stopArtifactCronJobs();
 
@@ -133,7 +133,16 @@ function startArtifactCronJobs(handler) {
     if (!$.env.isNode) return;
 
     syncArtifactByName = handler;
+    artifactCronEnabled = true;
     refreshArtifactCronJobs();
+}
+
+function artifactCronStatus() {
+    return {
+        enabled: artifactCronEnabled,
+        scheduled: artifactCronJobs.size,
+        running: runningArtifactCronNames.size,
+    };
 }
 
 export {
@@ -147,5 +156,6 @@ export {
     shouldSyncArtifactInGlobalCron,
     startArtifactCronJobs,
     stopArtifactCronJobs,
+    artifactCronStatus,
     validateArtifactCron,
 };

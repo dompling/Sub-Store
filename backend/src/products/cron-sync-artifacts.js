@@ -18,8 +18,23 @@ import {
     resolveCronArtifactSyncPolicy,
     shouldSkipCronArtifactWithoutUploadCredentials,
 } from '@/utils/artifact-sync-policy';
+import { initializeExtensionHost } from '@/extensions/host';
+import { EXTENSION_IDS } from '@/extensions/contracts';
 
 !(async function () {
+    const { manager: extensionManager } = initializeExtensionHost({
+        restoreEnabled: false,
+    });
+    try {
+        extensionManager.guard(EXTENSION_IDS.configHosting);
+    } catch (error) {
+        $.warn(
+            `[CONFIG HOSTING] scheduled command skipped: ${
+                error.code || error.message || error
+            }`,
+        );
+        return;
+    }
     let arg;
     if (typeof $argument != 'undefined') {
         // eslint-disable-next-line no-undef

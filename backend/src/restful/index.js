@@ -11,7 +11,10 @@ import {
 } from '@/restful/sync';
 import { gistBackupAction } from '@/restful/miscs';
 import { SETTINGS_KEY } from '@/constants';
-import { startArtifactCronJobs } from '@/utils/artifact-cron';
+import {
+    startArtifactCronJobs,
+    stopArtifactCronJobs,
+} from '@/utils/artifact-cron';
 import { createFrontendStaticMiddleware } from '@/utils/frontend-static';
 
 import registerSubscriptionRoutes from './subscriptions';
@@ -34,9 +37,20 @@ import registerAgeRoutes from './age';
 import { consumeShareToken } from './token';
 import { AGE_PUBLIC_KEY } from '@/utils/age';
 import { registerExtensionRoutes } from '@/extensions/registry';
-import '@/extensions/config-generator';
+import { registerExtensionControlRoutes } from './extensions';
+import { initializeExtensionHost } from '@/extensions/host';
+import { loadBundledExtensions } from '@/extensions/bundled';
+import { createConfigHostingRouteApps } from '@/extensions/config-hosting';
+import { EXTENSION_IDS } from '@/extensions/contracts';
 
 export default function serve() {
+    const { manager: extensionManager } = initializeExtensionHost({
+        configHosting: {
+            startScheduledJobs: () => startArtifactCronJobs(syncArtifactItem),
+            stopScheduledJobs: stopArtifactCronJobs,
+        },
+    });
+    loadBundledExtensions(extensionManager);
     let port;
     let host;
     if ($.env.isNode) {
@@ -121,18 +135,41 @@ export default function serve() {
     registerCollectionRoutes($app);
     registerSubscriptionRoutes($app);
     // Extensions may expose download URLs that are more specific than the
-    // generic subscription routes below, so register them first.
-    registerExtensionRoutes($app, { produceBuiltinArtifact });
+    // generic and dynamic control routes below, so register them first.
+    registerExtensionRoutes($app, {
+        produceBuiltinArtifact,
+        extensionManager,
+    });
+    // Extension lifecycle/control-plane routes are registered independently
+    // from extension business routes. Read-only runtime/catalog APIs are
+    // always available; lifecycle mutations enforce the admin boundary in
+    // restful/extensions.js. Keep this after artifact-sources so the dynamic
+    // /api/extensions/:id route cannot shadow that fixed route.
+    registerExtensionControlRoutes($app, extensionManager);
+
+    const configHostingSimpleApps = createConfigHostingRouteApps(
+        $app,
+        extensionManager,
+        'simple',
+    );
+    const configHostingParserApps = createConfigHostingRouteApps(
+        $app,
+        extensionManager,
+        'parser',
+    );
     registerDownloadRoutes($app);
     registerPreviewRoutes($app);
-    registerSortingRoutes($app);
+    registerSortingRoutes(configHostingSimpleApps.legacy);
+    registerSortingRoutes(configHostingSimpleApps.canonical);
     registerSettingRoutes($app);
-    registerArtifactRoutes($app);
+    registerArtifactRoutes(configHostingSimpleApps.legacy);
+    registerArtifactRoutes(configHostingSimpleApps.canonical);
     registerFileRoutes($app);
     registerTokenRoutes($app);
     registerArchiveRoutes($app);
     registerModuleRoutes($app);
-    registerSyncRoutes($app);
+    registerSyncRoutes(configHostingParserApps.legacy);
+    registerSyncRoutes(configHostingParserApps.canonical);
     registerNodeInfoRoutes($app);
     registerMiscRoutes($app);
     registerParserRoutes($app);
@@ -142,8 +179,6 @@ export default function serve() {
     $app.start();
 
     if ($.env.isNode) {
-        startArtifactCronJobs(syncArtifactItem);
-
         // Deprecated: SUB_STORE_BACKEND_CRON, SUB_STORE_CRON
         const backend_sync_cron = eval(
             'process.env.SUB_STORE_BACKEND_SYNC_CRON',
@@ -156,6 +191,7 @@ export default function serve() {
                 backend_sync_cron,
                 async function () {
                     try {
+                        extensionManager.guard(EXTENSION_IDS.configHosting);
                         $.info(`[SYNC CRON] ${backend_sync_cron} started`);
                         await syncArtifacts({ skipCronArtifacts: true });
                         $.info(`[SYNC CRON] ${backend_sync_cron} finished`);
@@ -200,6 +236,9 @@ export default function serve() {
                         cron.trim(),
                         async function () {
                             try {
+                                extensionManager.guard(
+                                    EXTENSION_IDS.configHosting,
+                                );
                                 $.info(
                                     `[PRODUCE CRON] ${type} ${name} ${cron} started`,
                                 );
