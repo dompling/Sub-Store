@@ -6,6 +6,7 @@ import {
     verifyReceipt,
     verifySignedEnvelope,
 } from './signature';
+import { isCommunityContentPackage } from './sources';
 
 const RESERVED_PACKAGE_FILES = new Set([
     'manifest.json',
@@ -13,9 +14,9 @@ const RESERVED_PACKAGE_FILES = new Set([
     'package.json',
     'active.json',
 ]);
-const MAX_PACKAGE_FILES = 128;
-const MAX_PACKAGE_FILE_BYTES = 2 * 1024 * 1024;
-const MAX_PACKAGE_BYTES = 8 * 1024 * 1024;
+export const MAX_PACKAGE_FILES = 128;
+export const MAX_PACKAGE_FILE_BYTES = 2 * 1024 * 1024;
+export const MAX_PACKAGE_BYTES = 8 * 1024 * 1024;
 
 function nodeModule(name) {
     try {
@@ -175,20 +176,6 @@ export class NodeExtensionPackageStore {
         );
     }
 
-    assertOwnedDirectory(extensionId, directory) {
-        const root = this.path.resolve(this.extensionRoot(extensionId));
-        const candidate = this.path.resolve(directory || '');
-        if (!isContainedPath(this.path, root, candidate)) {
-            const error = new Error(
-                'Extension package directory is outside its managed root',
-            );
-            error.code = 'EXTENSION_PACKAGE_PATH_INVALID';
-            error.statusCode = 409;
-            throw error;
-        }
-        return candidate;
-    }
-
     assertManagedExtensionRoot(extensionId) {
         const root = this.path.resolve(this.rootPath);
         const extensionRoot = this.path.resolve(
@@ -310,7 +297,7 @@ export class NodeExtensionPackageStore {
         this.verificationOptions = { ...options };
     }
 
-    validatePackageInput(packageInput) {
+    validatePackageInput(packageInput, { allowCommunityContent = false } = {}) {
         const { manifest, receipt, payload, signature } = packageInput || {};
         const packageDigest = packageInput?.packageDigest;
         const selectedVariant = packageInput?.selectedVariant;
@@ -400,9 +387,13 @@ export class NodeExtensionPackageStore {
                 throw error;
             }
         }
+        const communityContent =
+            allowCommunityContent && isCommunityContentPackage(packageInput);
         const envelopeResult = verifySignedEnvelope(
             { payload, signature },
-            this.verificationOptions,
+            communityContent
+                ? { ...this.verificationOptions, allowDigestOnly: true }
+                : this.verificationOptions,
         );
         if (!envelopeResult.valid) {
             const error = new Error(
@@ -423,9 +414,9 @@ export class NodeExtensionPackageStore {
         };
     }
 
-    verifyDirectory(directory, packageInput) {
+    verifyDirectory(directory, packageInput, options = {}) {
         const { manifest, receipt, payload } = packageInput;
-        const verifiedInput = this.validatePackageInput(packageInput);
+        const verifiedInput = this.validatePackageInput(packageInput, options);
         const ownedDirectory = this.assertExistingOwnedDirectory(
             manifest.id,
             directory,
@@ -552,9 +543,9 @@ export class NodeExtensionPackageStore {
         };
     }
 
-    stage(packageInput) {
+    stage(packageInput, options = {}) {
         if (!this.available) return null;
-        const verifiedInput = this.validatePackageInput(packageInput);
+        const verifiedInput = this.validatePackageInput(packageInput, options);
         const { manifest, receipt, payload } = packageInput || {};
         const extensionId = manifest?.id;
         const version = manifest?.version;
@@ -572,7 +563,7 @@ export class NodeExtensionPackageStore {
             packageDigest,
         );
         if (this.fs.existsSync(finalDirectory)) {
-            return this.verifyDirectory(finalDirectory, packageInput);
+            return this.verifyDirectory(finalDirectory, packageInput, options);
         }
 
         const parent = this.path.dirname(finalDirectory);
@@ -659,12 +650,16 @@ export class NodeExtensionPackageStore {
         } catch (error) {
             this.fs.rmSync(stagingDirectory, { recursive: true, force: true });
             if (this.fs.existsSync(finalDirectory)) {
-                return this.verifyDirectory(finalDirectory, packageInput);
+                return this.verifyDirectory(
+                    finalDirectory,
+                    packageInput,
+                    options,
+                );
             }
             throw error;
         }
 
-        return this.verifyDirectory(finalDirectory, packageInput);
+        return this.verifyDirectory(finalDirectory, packageInput, options);
     }
 
     activate(record) {
@@ -716,7 +711,7 @@ export class NodeExtensionPackageStore {
         }
     }
 
-    load(record) {
+    verifyInstalledRecord(record) {
         if (!record?.entrypoint || !this.available) return null;
         if (
             !isSha256Digest(record.packageDigest) ||
@@ -953,9 +948,43 @@ export class NodeExtensionPackageStore {
             error.statusCode = 409;
             throw error;
         }
-        this.evictRequireCache(packageDirectory);
+        return {
+            packageDirectory,
+            entrypoint,
+            manifest,
+            receipt,
+            packageMetadata,
+            files,
+            reconstructedPayload,
+        };
+    }
+
+    readVerifiedFile(record, relativeName) {
+        const verified = this.verifyInstalledRecord(record);
+        const relativeFile = safeRelativeFile(relativeName);
+        if (
+            !Object.prototype.hasOwnProperty.call(verified.files, relativeFile)
+        ) {
+            const error = new Error(
+                `Extension package asset is unavailable: ${relativeFile}`,
+            );
+            error.code = 'EXTENSION_PACKAGE_ASSET_NOT_FOUND';
+            error.statusCode = 404;
+            throw error;
+        }
+        return {
+            path: relativeFile,
+            content: verified.files[relativeFile],
+            digest: verified.packageMetadata.fileDigests[relativeFile],
+            packageDigest: verified.packageMetadata.packageDigest,
+        };
+    }
+
+    load(record) {
+        const verified = this.verifyInstalledRecord(record);
+        this.evictRequireCache(verified.packageDirectory);
         const requireModule = eval('require');
-        return requireModule(entrypoint);
+        return requireModule(verified.entrypoint);
     }
 
     deactivate(extensionId, record) {
@@ -968,6 +997,42 @@ export class NodeExtensionPackageStore {
         if (record?.packageDirectory) {
             this.evictRequireCache(record.packageDirectory);
         }
+    }
+
+    removeVersion(record) {
+        if (
+            !this.available ||
+            !record?.extensionId ||
+            !record?.version ||
+            !record?.packageDigest ||
+            !record?.packageDirectory
+        ) {
+            return;
+        }
+        const candidate = this.path.resolve(record.packageDirectory);
+        if (!this.fs.existsSync(candidate)) return;
+        const ownedDirectory = this.assertExistingOwnedDirectory(
+            record.extensionId,
+            candidate,
+        );
+        const expectedDirectory = this.versionRoot(
+            record.extensionId,
+            record.version,
+            record.packageDigest,
+        );
+        if (
+            !this.fs.existsSync(expectedDirectory) ||
+            this.fs.realpathSync(expectedDirectory) !== ownedDirectory
+        ) {
+            const error = new Error(
+                'Extension package path does not match the version selected for cleanup',
+            );
+            error.code = 'EXTENSION_PACKAGE_PATH_INVALID';
+            error.statusCode = 409;
+            throw error;
+        }
+        this.evictRequireCache(ownedDirectory);
+        this.fs.rmSync(ownedDirectory, { recursive: true, force: true });
     }
 
     remove(record) {

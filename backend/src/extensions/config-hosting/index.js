@@ -71,8 +71,18 @@ export function createConfigHostingAdapter({
         manifest,
         activate() {
             if (active) return this.health();
-            startScheduledJobs?.();
             active = true;
+            try {
+                startScheduledJobs?.({ isActive: () => active });
+            } catch (error) {
+                active = false;
+                try {
+                    stopScheduledJobs?.();
+                } catch (cleanupError) {
+                    error.cleanupError = cleanupError;
+                }
+                throw error;
+            }
             return {
                 active,
                 implementationAbi: manifest.host.implementationAbi,
@@ -80,8 +90,10 @@ export function createConfigHostingAdapter({
         },
         deactivate() {
             if (!active) return this.health();
-            stopScheduledJobs?.();
+            // Close the adapter gate before touching scheduler resources. A
+            // failing stop hook must not leave the extension logically active.
             active = false;
+            stopScheduledJobs?.();
             return { active };
         },
         health() {

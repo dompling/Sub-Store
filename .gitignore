@@ -143,3 +143,7 @@ CHANGELOG.md
 CODEMAP.md
 CONTEXT_BUNDLE.md
 mydocs
+
+# Local agent workflow state
+.agents/
+skills/

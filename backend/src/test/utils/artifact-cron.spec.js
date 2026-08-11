@@ -124,4 +124,24 @@ describe('artifact cron policy', function () {
 
         expect(calls).to.deep.equal(['demo', 'demo']);
     });
+
+    it('fails closed after the owning extension is deactivated', async function () {
+        const calls = [];
+        let active = true;
+        startArtifactCronJobs(
+            async (name) => {
+                calls.push(name);
+            },
+            { isActive: () => active },
+        );
+
+        await runArtifactCron('demo', 'demo', '* * * * * *');
+        active = false;
+        await runArtifactCron('demo', 'demo', '* * * * * *');
+        stopArtifactCronJobs();
+        active = true;
+        await runArtifactCron('demo', 'demo', '* * * * * *');
+
+        expect(calls).to.deep.equal(['demo']);
+    });
 });

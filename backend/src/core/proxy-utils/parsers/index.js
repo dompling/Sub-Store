@@ -279,7 +279,7 @@ function URI_SS() {
                 content = `${content}${query}`;
             }
             userInfoStr = content.match(/(^.*)@/)?.[1];
-            serverAndPortArray = content.match(/@([^/@]*)(\/|$)/);
+            serverAndPortArray = content.match(/@([^/@?]*)(\/|\?|$)/);
         } else if (content.includes('?')) {
             const parsed = content.match(/(\?.*)$/);
             query = parsed[1];

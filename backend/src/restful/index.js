@@ -46,7 +46,8 @@ import { EXTENSION_IDS } from '@/extensions/contracts';
 export default function serve() {
     const { manager: extensionManager } = initializeExtensionHost({
         configHosting: {
-            startScheduledJobs: () => startArtifactCronJobs(syncArtifactItem),
+            startScheduledJobs: ({ isActive } = {}) =>
+                startArtifactCronJobs(syncArtifactItem, { isActive }),
             stopScheduledJobs: stopArtifactCronJobs,
         },
     });

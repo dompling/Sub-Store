@@ -1,7 +1,6 @@
-// Static bundled entrypoint catalog. Importing this module preserves the
-// current config-generator activation side effect while giving the Host one
-// explicit place to load bundled implementations.
-import './config-generator';
+// Static bundled entrypoint catalog. Lifecycle adapters and contribution
+// descriptors are registered explicitly by the Host; importing this module
+// must not activate an extension as a side effect.
 import { bundledExtensionCatalog } from './catalog.generated';
 import { getExtensionManager } from './manager';
 import { listRegisteredExtensions } from './registry';

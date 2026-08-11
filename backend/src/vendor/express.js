@@ -16,7 +16,7 @@ export default function express({ substore: $, port, host }) {
         'Content-Type': 'text/plain;charset=UTF-8',
         'Access-Control-Allow-Methods': 'POST,GET,OPTIONS,PATCH,PUT,DELETE',
         'Access-Control-Allow-Headers':
-            'Origin, X-Requested-With, Content-Type, Accept',
+            'Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Idempotency-Key, X-Sub-Store-Extension-Revision',
         'X-Powered-By': isNode
             ? eval('process.env.SUB_STORE_X_POWERED_BY') || 'Sub-Store'
             : 'Sub-Store',
@@ -28,7 +28,12 @@ export default function express({ substore: $, port, host }) {
         const bodyParser = eval(`require("body-parser")`);
         const app = express_();
         const limit = eval('process.env.SUB_STORE_BODY_JSON_LIMIT') || '1mb';
+        const extensionDirectoryLimit =
+            eval('process.env.SUB_STORE_EXTENSION_DIRECTORY_LIMIT') || '12mb';
         $.info(`[BACKEND] body JSON limit: ${limit}`);
+        $.info(
+            `[BACKEND] extension directory JSON limit: ${extensionDirectoryLimit}`,
+        );
         app.use((req, res, next) => {
             const originalSetHeader = res.setHeader.bind(res);
 
@@ -84,6 +89,13 @@ export default function express({ substore: $, port, host }) {
         app.use(
             bodyParser.json({
                 verify: rawBodySaver,
+                limit: extensionDirectoryLimit,
+                type: 'application/vnd.substore.extension-directory+json',
+            }),
+        );
+        app.use(
+            bodyParser.json({
+                verify: rawBodySaver,
                 limit,
             }),
         );
@@ -91,6 +103,12 @@ export default function express({ substore: $, port, host }) {
             bodyParser.urlencoded({ verify: rawBodySaver, extended: true }),
         );
         app.use(bodyParser.raw({ verify: rawBodySaver, type: '*/*' }));
+
+        // A router mounted before the server starts keeps a stable position in
+        // the parent stack while verified extensions add guarded routes to it
+        // later. Expose only the factory; extension packages never receive the
+        // root Express application directly.
+        app.createRouter = () => express_.Router();
 
         // adapter
         app.start = () => {
@@ -101,6 +119,7 @@ export default function express({ substore: $, port, host }) {
                 const { address, port } = listener.address();
                 $.info(`[BACKEND] listening on ${address}:${port}`);
             });
+            return listener;
         };
         return app;
     }
@@ -308,7 +327,9 @@ export default function express({ substore: $, port, host }) {
         return {
             allowed,
             preflight:
-                Boolean(origin) && allowed && method?.toUpperCase() === 'OPTIONS',
+                Boolean(origin) &&
+                allowed &&
+                method?.toUpperCase() === 'OPTIONS',
             headers: allowed ? getCorsHeaders(corsPolicy, origin) : {},
         };
     }

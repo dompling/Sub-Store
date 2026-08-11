@@ -157,6 +157,63 @@ SUB_STORE_BACKEND_API_PORT=3000 pnpm run --parallel "/^dev:.*/"
 pnpm bundle:esbuild
 ```
 
+### Docker (backend only)
+
+This deployment follows the data-path and environment conventions documented
+by the official [`xream/sub-store` image](https://hub.docker.com/r/xream/sub-store),
+while intentionally building only this repository's Node backend. It does not
+bundle the Front-End or HTTP-META. The raw backend therefore listens on
+container port `3000`, rather than the combined image's Front-End port `3001`.
+
+The container runs as a non-root user and stores Sub-Store data, MMDB files,
+backups, and installed extension packages under `/opt/app/data`. The default is
+the named `sub-store-data` volume. Set `SUB_STORE_DATA_PATH` in `.env` to an
+absolute host directory such as `/root/sub-store-data` to use the bind-mount
+layout shown in the official quick-start guide.
+
+```bash
+cp .env.example .env
+docker compose up -d --build
+docker compose ps
+```
+
+The API is published at `http://127.0.0.1:3000` by default. Change
+`SUB_STORE_BACKEND_PORT` to use another host port, or set
+`SUB_STORE_BACKEND_BIND_ADDRESS=0.0.0.0` when the backend must be reachable from
+the LAN. The example CORS allowlist accepts the local Front-End dev server on
+port `8888` and the official hosted Front-End. For a shared deployment, replace
+it with the exact origins you use and protect extension-management operations
+with either `SUB_STORE_EXTENSION_ADMIN_TOKEN` or its SHA-256 digest in
+`SUB_STORE_EXTENSION_ADMIN_TOKEN_HASH`.
+
+The Compose service also passes through the official backend variables for
+sync scheduling, push notifications, default proxy, backup/restore jobs,
+background production, remote data restore, and optional backend path-prefix
+mode. See `.env.example` for the local template and the official image page for
+their full semantics.
+
+An equivalent direct Docker launch is:
+
+```bash
+docker build -t sub-store-backend:local ./backend
+docker run -d --name sub-store-backend --restart unless-stopped \
+  --env-file .env \
+  -e SUB_STORE_BACKEND_API_HOST=0.0.0.0 \
+  -e SUB_STORE_BACKEND_API_PORT=3000 \
+  -e SUB_STORE_DATA_BASE_PATH=/opt/app/data \
+  -p 127.0.0.1:3000:3000 \
+  -v sub-store-data:/opt/app/data \
+  sub-store-backend:local
+```
+
+```bash
+docker compose logs -f backend
+docker compose down
+```
+
+`docker compose down` keeps the named data volume. Add `--volumes` only when
+you intentionally want to delete all persisted Sub-Store data.
+
 ## LICENSE
 
 This project is under the GPL V3 LICENSE.

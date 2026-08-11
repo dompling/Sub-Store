@@ -91,9 +91,9 @@ describe('express CORS allowlist adapter', function () {
                 expect(
                     official.headers.get('access-control-allow-origin'),
                 ).to.equal('https://sub-store.vercel.app');
-                expect(local.headers.get('access-control-allow-origin')).to.equal(
-                    'http://127.0.0.1:8888',
-                );
+                expect(
+                    local.headers.get('access-control-allow-origin'),
+                ).to.equal('http://127.0.0.1:8888');
                 expect(official.headers.get('vary')).to.include('Origin');
             },
         );
@@ -123,6 +123,58 @@ describe('express CORS allowlist adapter', function () {
                 );
             },
         );
+    });
+
+    it('serves extension routes registered after the Node listener starts', async function () {
+        const app = express({
+            substore: {
+                info() {},
+            },
+            port: 0,
+            host: HOST,
+        });
+        const extensionRoutes = app.createRouter();
+        app.use(extensionRoutes);
+        app.get('/download/:name/:target', (req, res) => {
+            res.json({ source: 'generic-download' });
+        });
+        const server = app.start();
+
+        try {
+            await waitForListening(server);
+            extensionRoutes.get('/late-extension-route', (req, res) => {
+                res.json({ status: 'success' });
+            });
+            extensionRoutes.get(
+                '/download/config-project/:name',
+                (req, res) => {
+                    res.json({ source: 'extension-download' });
+                },
+            );
+            const { port } = server.address();
+
+            const lateRoute = await fetch(
+                `http://${HOST}:${port}/late-extension-route`,
+            );
+            const extensionDownload = await fetch(
+                `http://${HOST}:${port}/download/config-project/demo`,
+            );
+            const missingRoute = await fetch(
+                `http://${HOST}:${port}/missing-route`,
+            );
+
+            expect(lateRoute.status).to.equal(200);
+            expect(await lateRoute.json()).to.deep.equal({
+                status: 'success',
+            });
+            expect(extensionDownload.status).to.equal(200);
+            expect(await extensionDownload.json()).to.deep.equal({
+                source: 'extension-download',
+            });
+            expect(missingRoute.status).to.equal(404);
+        } finally {
+            if (server) await close(server);
+        }
     });
 
     async function withServer(corsEnv, run) {
@@ -174,6 +226,15 @@ describe('express CORS allowlist adapter', function () {
                 if (error) reject(error);
                 else resolve();
             });
+        });
+    }
+
+    function waitForListening(server) {
+        if (!server) return Promise.reject(new Error('server unavailable'));
+        if (server.listening) return Promise.resolve();
+        return new Promise((resolve, reject) => {
+            server.once('listening', resolve);
+            server.once('error', reject);
         });
     }
 });

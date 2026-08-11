@@ -4,7 +4,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { ARTIFACTS_KEY } from '@/constants';
+import { ARTIFACTS_KEY, CONFIG_GENERATOR_KEY } from '@/constants';
 import {
     EXTENSION_IDS,
     canonicalJson,
@@ -14,6 +14,7 @@ import {
 } from '@/extensions/contracts';
 import {
     createLocalOfficialPackage,
+    embeddedExtensionImplementations,
     officialExtensionTrustedKeys,
     signedExtensionCatalog,
 } from '@/extensions/catalog.generated';
@@ -26,27 +27,33 @@ import { sha256Hex, verifySignedEnvelope } from '@/extensions/signature';
 import { initializeExtensionHost } from '@/extensions/host';
 import { registerExtensionControlRoutes } from '@/restful/extensions';
 import configHostingManifest from '@/extensions/config-hosting/manifest.json';
+import configGeneratorManifest from '@/extensions/official-packages/org.substore.config-generator/manifest.json';
 import {
     createConfigHostingAdapter,
     createConfigHostingRouteApps,
 } from '@/extensions/config-hosting';
-import { resolveExtensionRouteLane } from '@/extensions/registry';
+import {
+    clearExtensionRegistryForTests,
+    resolveExtensionRouteLane,
+} from '@/extensions/registry';
 
 function createStore(initial) {
-    let value = initial;
-    return {
-        read() {
-            return value;
-        },
-        write(next) {
-            value = next;
-        },
-    };
+    return createKeyStore(
+        initial === undefined
+            ? {}
+            : {
+                  '#sub-store-extensions':
+                      typeof initial === 'string'
+                          ? initial
+                          : JSON.stringify(initial),
+              },
+    );
 }
 
 function createKeyStore(initial = {}) {
     const values = { ...initial };
     let writes = 0;
+    let writtenKeys = [];
     return {
         read(key) {
             return Object.prototype.hasOwnProperty.call(values, key)
@@ -56,9 +63,21 @@ function createKeyStore(initial = {}) {
         write(value, key) {
             values[key] = value;
             writes += 1;
+            writtenKeys.push(key);
+        },
+        delete(key) {
+            delete values[key];
+            writes += 1;
+            writtenKeys.push(key);
         },
         writes() {
             return writes;
+        },
+        writtenKeys() {
+            return [...writtenKeys];
+        },
+        resetWrittenKeys() {
+            writtenKeys = [];
         },
     };
 }
@@ -126,6 +145,17 @@ function createResponse() {
 }
 
 describe('Extension Host foundation', function () {
+    it('keeps the Host generic and lets config-generator packages self-register', function () {
+        const hostSource = fs.readFileSync(
+            path.resolve(process.cwd(), 'src/extensions/host.js'),
+            'utf8',
+        );
+        expect(hostSource).to.not.include('configGeneratorAdapter');
+        expect(hostSource).to.not.match(
+            /config-generator\/(?:index|adapter|embedded)/,
+        );
+    });
+
     it('validates namespaced manifests and exposes product lane metadata', function () {
         const manifest = normalizeExtensionManifest(configHostingManifest);
         expect(manifest.id).to.equal(EXTENSION_IDS.configHosting);
@@ -155,29 +185,90 @@ describe('Extension Host foundation', function () {
         expect(result.valid).to.equal(true);
         expect(result.trust).to.equal('trusted');
         expect(canonicalJson(signedExtensionCatalog.payload)).to.be.a('string');
-        for (const runtime of ['node', 'qx', 'loon', 'surge', 'stash']) {
-            const packageInput = createLocalOfficialPackage(
-                EXTENSION_IDS.configHosting,
-                runtime,
-            );
-            const packageResult = verifySignedEnvelope(
-                {
-                    payload: packageInput.payload,
-                    signature: packageInput.signature,
-                },
-                { trustedKeys: officialExtensionTrustedKeys },
-            );
-            expect(packageResult).to.include({
-                valid: true,
-                trust: 'trusted',
-            });
-            const signedEntry = signedExtensionCatalog.payload.entries.find(
-                (entry) => entry.id === EXTENSION_IDS.configHosting,
-            );
-            expect(
-                signedEntry.packageDigests[packageInput.selectedVariant],
-            ).to.equal(packageInput.packageDigest);
+        for (const extensionId of [
+            EXTENSION_IDS.configGenerator,
+            EXTENSION_IDS.configHosting,
+        ]) {
+            const runtimes =
+                extensionId === EXTENSION_IDS.configGenerator
+                    ? ['qx', 'loon', 'surge', 'stash']
+                    : ['node', 'qx', 'loon', 'surge', 'stash'];
+            for (const runtime of runtimes) {
+                const packageInput = createLocalOfficialPackage(
+                    extensionId,
+                    runtime,
+                );
+                const packageResult = verifySignedEnvelope(
+                    {
+                        payload: packageInput.payload,
+                        signature: packageInput.signature,
+                    },
+                    { trustedKeys: officialExtensionTrustedKeys },
+                );
+                expect(packageResult).to.include({
+                    valid: true,
+                    trust: 'trusted',
+                });
+                const signedEntry = signedExtensionCatalog.payload.entries.find(
+                    (entry) => entry.id === extensionId,
+                );
+                expect(
+                    signedEntry.packageDigests[packageInput.selectedVariant],
+                ).to.equal(packageInput.packageDigest);
+            }
         }
+    });
+
+    it('models config-generator as an official package rather than a bundled lifecycle record', function () {
+        expect(configGeneratorManifest).to.include({
+            kind: 'trusted-official',
+            distribution: 'store',
+        });
+        expect(configGeneratorManifest.variants.node).to.include({
+            entrypoint: 'backend/index.cjs',
+            containsExecutableCode: true,
+        });
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+        });
+        expect(
+            manager.getAvailability(EXTENSION_IDS.configGenerator).status,
+        ).to.equal('missing');
+    });
+
+    it('binds the synchronized script artifact to Host-owned provenance metadata', function () {
+        const metadata = JSON.parse(
+            fs.readFileSync(
+                path.resolve(
+                    process.cwd(),
+                    'src/extensions/embedded/org.substore.config-generator.generated.json',
+                ),
+                'utf8',
+            ),
+        );
+        const artifact = fs.readFileSync(
+            path.resolve(
+                process.cwd(),
+                'src/extensions/embedded/org.substore.config-generator.generated.js',
+            ),
+        );
+        expect(metadata).to.include({
+            extensionId: EXTENSION_IDS.configGenerator,
+            version: configGeneratorManifest.version,
+            implementationAbi: configGeneratorManifest.host.implementationAbi,
+            packageDigest: signedExtensionCatalog.payload.entries.find(
+                (entry) => entry.id === EXTENSION_IDS.configGenerator,
+            ).packageDigests.node,
+        });
+        expect(sha256Hex(artifact)).to.equal(metadata.artifactSha256);
+        expect(
+            embeddedExtensionImplementations[EXTENSION_IDS.configGenerator],
+        ).to.include({
+            implementationAbi: metadata.implementationAbi,
+            artifactSha256: metadata.artifactSha256,
+            sourceTreeSha256: metadata.sourceTreeSha256,
+        });
     });
 
     it('keeps digest-only verification disabled by default and reports its trust mode accurately', function () {
@@ -436,68 +527,251 @@ describe('Extension Host foundation', function () {
         );
     });
 
-    it('exposes read-only runtime/catalog/installed and protected lifecycle routes', async function () {
-        const manager = new ExtensionManager({
-            store: createStore(undefined),
-            env: { isNode: true },
-            allowDigestOnly: true,
+    it('migrates aggregate lifecycle records into one root key per extension', function () {
+        const configGeneratorRecord = {
+            extensionId: EXTENSION_IDS.configGenerator,
+            version: '1.1.0',
+            installationStatus: 'installed',
+            dataStatus: 'active',
+            enabled: false,
+        };
+        const configHostingRecord = {
+            extensionId: EXTENSION_IDS.configHosting,
+            version: '1.0.0',
+            installationStatus: 'installed',
+            dataStatus: 'active',
+            enabled: true,
+        };
+        const store = createKeyStore({
+            '#sub-store-extensions': JSON.stringify({
+                schemaVersion: 1,
+                revision: 7,
+                storeRevision: 7,
+                dataGeneration: 3,
+                installed: {
+                    [EXTENSION_IDS.configGenerator]: configGeneratorRecord,
+                    [EXTENSION_IDS.configHosting]: configHostingRecord,
+                },
+                sources: {},
+                migrations: {},
+                tasks: [],
+                audit: [],
+            }),
         });
-        const { app, handlers } = createRouteApp();
-        registerExtensionControlRoutes(app, manager);
+        const manager = new ExtensionManager({
+            store,
+            env: { isNode: true },
+        });
 
-        const runtimeResponse = createResponse();
-        handlers.get('GET /api/extensions/runtime')(
-            { headers: {} },
-            runtimeResponse,
-        );
-        expect(runtimeResponse.body.data.extensions).to.have.length(2);
-        expect(runtimeResponse.headers.ETag).to.equal(
-            `W/"extensions-${runtimeResponse.body.data.storageIdentity}-${runtimeResponse.body.data.revision}"`,
-        );
+        expect(manager.getRuntimeManifest()).to.include({
+            revision: 7,
+            dataGeneration: 3,
+        });
+        expect(store.read('#sub-store-extensions')).to.equal(undefined);
 
-        const installResponse = createResponse();
-        await handlers.get('GET /api/extensions/catalog')(
-            { headers: {} },
-            installResponse,
-        );
+        const index = JSON.parse(store.read('#sub-store-extension-index'));
+        expect(index).to.not.have.property('installed');
+        expect(index.extensionIds).to.have.members([
+            EXTENSION_IDS.configGenerator,
+            EXTENSION_IDS.configHosting,
+        ]);
         expect(
-            installResponse.body.data.entries.map((item) => item.id),
-        ).to.include(EXTENSION_IDS.configHosting);
+            JSON.parse(
+                store.read(
+                    `#sub-store-extension:${EXTENSION_IDS.configGenerator}`,
+                ),
+            ),
+        ).to.deep.equal(configGeneratorRecord);
+        expect(
+            JSON.parse(
+                store.read(
+                    `#sub-store-extension:${EXTENSION_IDS.configHosting}`,
+                ),
+            ),
+        ).to.deep.equal(configHostingRecord);
+    });
 
-        const protectedResponse = createResponse();
-        await handlers.get('GET /api/extensions/runtime')(
-            { headers: {} },
-            protectedResponse,
-        );
-        expect(protectedResponse.statusCode).to.equal(200);
+    it('writes only the changed extension record plus the shared index', function () {
+        const store = createKeyStore({
+            '#sub-store-extensions': JSON.stringify({
+                schemaVersion: 1,
+                revision: 2,
+                storeRevision: 2,
+                dataGeneration: 1,
+                installed: {
+                    [EXTENSION_IDS.configGenerator]: {
+                        extensionId: EXTENSION_IDS.configGenerator,
+                        version: '1.1.0',
+                        enabled: false,
+                    },
+                    [EXTENSION_IDS.configHosting]: {
+                        extensionId: EXTENSION_IDS.configHosting,
+                        version: '1.0.0',
+                        enabled: true,
+                    },
+                },
+                sources: {},
+                migrations: {},
+                tasks: [],
+                audit: [],
+            }),
+        });
+        const manager = new ExtensionManager({
+            store,
+            env: { isNode: true },
+        });
 
-        const adminResponse = createResponse();
-        await handlers.get('POST /api/admin/extensions/:id/install')(
-            {
-                params: { id: EXTENSION_IDS.configHosting },
-                body: {},
-                headers: {},
-                extensionAdmin: true,
-            },
-            adminResponse,
-        );
-        expect(adminResponse.statusCode).to.equal(201);
-        expect(adminResponse.body.data.status).to.equal('installed-disabled');
+        manager.readState();
+        store.resetWrittenKeys();
+        manager._commit((state) => {
+            state.installed[EXTENSION_IDS.configGenerator].enabled = true;
+            return state;
+        });
 
-        const updateResponse = createResponse();
-        await handlers.get('POST /api/admin/extensions/:id/update')(
-            {
-                params: { id: EXTENSION_IDS.configHosting },
-                body: {},
-                headers: {},
-                extensionAdmin: true,
-            },
-            updateResponse,
-        );
-        expect(updateResponse.statusCode).to.equal(501);
-        expect(updateResponse.body.error.code).to.equal(
-            'EXTENSION_UPDATE_UNSUPPORTED',
-        );
+        expect(store.writtenKeys()).to.deep.equal([
+            `#sub-store-extension:${EXTENSION_IDS.configGenerator}`,
+            '#sub-store-extension-index',
+        ]);
+    });
+
+    it('allows extension management by default when no admin token is configured', async function () {
+        const previousToken = process.env.SUB_STORE_EXTENSION_ADMIN_TOKEN;
+        const previousHash = process.env.SUB_STORE_EXTENSION_ADMIN_TOKEN_HASH;
+        delete process.env.SUB_STORE_EXTENSION_ADMIN_TOKEN;
+        delete process.env.SUB_STORE_EXTENSION_ADMIN_TOKEN_HASH;
+
+        try {
+            const manager = new ExtensionManager({
+                store: createStore(undefined),
+                env: { isNode: true },
+                allowDigestOnly: true,
+            });
+            const { app, handlers } = createRouteApp();
+            registerExtensionControlRoutes(app, manager);
+
+            const runtimeResponse = createResponse();
+            handlers.get('GET /api/extensions/runtime')(
+                { headers: {} },
+                runtimeResponse,
+            );
+            expect(runtimeResponse.body.data.extensions).to.have.length(2);
+            expect(runtimeResponse.body.data.managementMode).to.equal('open');
+            expect(runtimeResponse.headers.ETag).to.equal(
+                `W/"extensions-${runtimeResponse.body.data.storageIdentity}-${runtimeResponse.body.data.revision}"`,
+            );
+
+            const catalogResponse = createResponse();
+            await handlers.get('GET /api/extensions/catalog')(
+                { headers: {} },
+                catalogResponse,
+            );
+            expect(
+                catalogResponse.body.data.entries.map((item) => item.id),
+            ).to.include(EXTENSION_IDS.configHosting);
+
+            const sourcesResponse = createResponse();
+            await handlers.get('GET /api/extensions/sources')(
+                { headers: {} },
+                sourcesResponse,
+            );
+            expect(sourcesResponse.statusCode).to.equal(200);
+            expect(sourcesResponse.body.data.items).to.deep.equal([]);
+
+            const installResponse = createResponse();
+            await handlers.get('POST /api/admin/extensions/:id/install')(
+                {
+                    params: { id: EXTENSION_IDS.configHosting },
+                    body: {},
+                    headers: {},
+                },
+                installResponse,
+            );
+            expect(installResponse.statusCode).to.equal(201);
+            expect(installResponse.body.data.status).to.equal(
+                'installed-disabled',
+            );
+        } finally {
+            if (previousToken === undefined)
+                delete process.env.SUB_STORE_EXTENSION_ADMIN_TOKEN;
+            else process.env.SUB_STORE_EXTENSION_ADMIN_TOKEN = previousToken;
+            if (previousHash === undefined)
+                delete process.env.SUB_STORE_EXTENSION_ADMIN_TOKEN_HASH;
+            else
+                process.env.SUB_STORE_EXTENSION_ADMIN_TOKEN_HASH = previousHash;
+        }
+    });
+
+    it('requires authentication only when an extension admin token is configured', async function () {
+        const previousToken = process.env.SUB_STORE_EXTENSION_ADMIN_TOKEN;
+        const previousHash = process.env.SUB_STORE_EXTENSION_ADMIN_TOKEN_HASH;
+        process.env.SUB_STORE_EXTENSION_ADMIN_TOKEN = 'extension-test-token';
+        delete process.env.SUB_STORE_EXTENSION_ADMIN_TOKEN_HASH;
+
+        try {
+            const manager = new ExtensionManager({
+                store: createStore(undefined),
+                env: { isNode: true },
+                allowDigestOnly: true,
+            });
+            const { app, handlers } = createRouteApp();
+            registerExtensionControlRoutes(app, manager);
+
+            expect(manager.getRuntimeManifest().managementMode).to.equal(
+                'token',
+            );
+
+            const missingResponse = createResponse();
+            await handlers.get('POST /api/admin/extensions/:id/install')(
+                {
+                    params: { id: EXTENSION_IDS.configHosting },
+                    body: {},
+                    headers: {},
+                },
+                missingResponse,
+            );
+            expect(missingResponse.statusCode).to.equal(401);
+            expect(missingResponse.body.error.code).to.equal(
+                'EXTENSION_ADMIN_AUTH_REQUIRED',
+            );
+
+            const invalidResponse = createResponse();
+            await handlers.get('POST /api/admin/extensions/:id/install')(
+                {
+                    params: { id: EXTENSION_IDS.configHosting },
+                    body: {},
+                    headers: { authorization: 'Bearer wrong-token' },
+                },
+                invalidResponse,
+            );
+            expect(invalidResponse.statusCode).to.equal(403);
+            expect(invalidResponse.body.error.code).to.equal(
+                'EXTENSION_ADMIN_UNAUTHORIZED',
+            );
+
+            const authorizedResponse = createResponse();
+            await handlers.get('POST /api/admin/extensions/:id/install')(
+                {
+                    params: { id: EXTENSION_IDS.configHosting },
+                    body: {},
+                    headers: {
+                        authorization: 'Bearer extension-test-token',
+                    },
+                },
+                authorizedResponse,
+            );
+            expect(authorizedResponse.statusCode).to.equal(201);
+            expect(authorizedResponse.body.data.status).to.equal(
+                'installed-disabled',
+            );
+        } finally {
+            if (previousToken === undefined)
+                delete process.env.SUB_STORE_EXTENSION_ADMIN_TOKEN;
+            else process.env.SUB_STORE_EXTENSION_ADMIN_TOKEN = previousToken;
+            if (previousHash === undefined)
+                delete process.env.SUB_STORE_EXTENSION_ADMIN_TOKEN_HASH;
+            else
+                process.env.SUB_STORE_EXTENSION_ADMIN_TOKEN_HASH = previousHash;
+        }
     });
 
     it('maps retained and disabled records to distinct availability states', function () {
@@ -591,25 +865,22 @@ describe('Extension Host foundation', function () {
         );
     });
 
-    it('returns structured unsupported lifecycle operations', function () {
+    it('returns a structured unsupported data purge operation', function () {
         const manager = new ExtensionManager({
             store: createStore(undefined),
             env: { isNode: true },
             allowDigestOnly: true,
         });
-        for (const [method, code] of [
-            ['update', 'EXTENSION_UPDATE_UNSUPPORTED'],
-            ['rollback', 'EXTENSION_ROLLBACK_UNSUPPORTED'],
-            ['purgeData', 'EXTENSION_DATA_PURGE_UNSUPPORTED'],
-        ]) {
-            let error;
-            try {
-                manager[method](EXTENSION_IDS.configHosting);
-            } catch (caught) {
-                error = caught;
-            }
-            expect(error).to.include({ code, statusCode: 501 });
+        let error;
+        try {
+            manager.purgeData(EXTENSION_IDS.configHosting);
+        } catch (caught) {
+            error = caught;
         }
+        expect(error).to.include({
+            code: 'EXTENSION_DATA_PURGE_UNSUPPORTED',
+            statusCode: 501,
+        });
     });
 
     it('adopts legacy artifacts once through the real Node package installer while leaving fresh stores untouched', function () {
@@ -734,6 +1005,107 @@ describe('Extension Host foundation', function () {
         }
     });
 
+    it('retains legacy config-generator data until its remote Node package is installed', function () {
+        const basePath = fs.mkdtempSync(
+            path.join(os.tmpdir(), 'sub-store-config-generator-adoption-'),
+        );
+        const legacyValue = {
+            version: 1,
+            projects: [{ name: 'legacy-project', rules: [] }],
+            ruleSets: [{ name: 'legacy-rules', rules: [] }],
+        };
+        try {
+            const legacyStore = createKeyStore({
+                [CONFIG_GENERATOR_KEY]: legacyValue,
+            });
+            const packageStore = createNodeExtensionPackageStore({ basePath });
+            const host = initializeExtensionHost({
+                reset: true,
+                store: legacyStore,
+                env: { isNode: true },
+                packageStore,
+                restoreEnabled: false,
+            });
+            expect(
+                host.manager.getRecord(EXTENSION_IDS.configGenerator),
+            ).to.include({
+                installationStatus: 'removed',
+                dataStatus: 'retained',
+                retainedReason: 'legacy-data',
+                codeStatus: 'missing',
+                adoptionStatus: 'reinstall-required',
+            });
+            expect(
+                host.manager.getAvailability(EXTENSION_IDS.configGenerator)
+                    .status,
+            ).to.equal('reinstall-required');
+            expect(legacyStore.read(CONFIG_GENERATOR_KEY)).to.deep.equal(
+                legacyValue,
+            );
+            const revision = host.manager.getRuntimeManifest().revision;
+            expect(
+                host.manager.adoptLegacyConfigGeneratorIfNeeded(),
+            ).to.include({
+                status: 'reinstall-required',
+                reasonCode: 'EXTENSION_SOURCE_PACKAGE_REQUIRED',
+                previouslyAttempted: true,
+            });
+            expect(host.manager.getRuntimeManifest().revision).to.equal(
+                revision,
+            );
+
+            let installError;
+            try {
+                host.manager.install(EXTENSION_IDS.configGenerator);
+            } catch (error) {
+                installError = error;
+            }
+            expect(installError).to.include({
+                code: 'EXTENSION_SOURCE_PACKAGE_REQUIRED',
+            });
+            expect(installError.details).to.include({
+                extensionId: EXTENSION_IDS.configGenerator,
+                localDirectorySupported: true,
+            });
+
+            resetExtensionManagerForTests();
+            const freshStore = createKeyStore();
+            const freshHost = initializeExtensionHost({
+                reset: true,
+                store: freshStore,
+                env: { isNode: true },
+                packageStore: createNodeExtensionPackageStore({
+                    basePath: `${basePath}-fresh`,
+                }),
+                restoreEnabled: false,
+            });
+            expect(
+                freshHost.manager.getAvailability(EXTENSION_IDS.configGenerator)
+                    .status,
+            ).to.equal('missing');
+            expect(freshStore.read(CONFIG_GENERATOR_KEY)).to.equal(undefined);
+            expect(freshStore.writes()).to.equal(0);
+
+            const scriptManager = new ExtensionManager({
+                store: createStore(undefined),
+                env: { isQX: true },
+            });
+            expect(
+                scriptManager.getAvailability(EXTENSION_IDS.configGenerator)
+                    .status,
+            ).to.equal('enabled');
+            expect(
+                scriptManager.getRecord(EXTENSION_IDS.configGenerator)
+                    .selectedVariant,
+            ).to.equal('qx');
+        } finally {
+            clearExtensionRegistryForTests();
+            resetExtensionManagerForTests();
+            fs.rmSync(basePath, { recursive: true, force: true });
+            fs.rmSync(`${basePath}-fresh`, { recursive: true, force: true });
+        }
+    });
+
     it('installs and activates the Node package from a verified version directory', function () {
         const basePath = fs.mkdtempSync(
             path.join(os.tmpdir(), 'sub-store-extension-test-'),
@@ -840,6 +1212,110 @@ describe('Extension Host foundation', function () {
             expect(() => manager.enable(EXTENSION_IDS.configHosting)).to.throw(
                 'failed verification',
             );
+            expect(
+                manager.getAvailability(EXTENSION_IDS.configHosting).status,
+            ).to.equal('disabled');
+        } finally {
+            fs.rmSync(basePath, { recursive: true, force: true });
+        }
+    });
+
+    it('disables and uninstalls an active Node package without reloading tampered bytes', function () {
+        const exercise = (action) => {
+            const basePath = fs.mkdtempSync(
+                path.join(os.tmpdir(), `sub-store-extension-${action}-tamper-`),
+            );
+            try {
+                let stops = 0;
+                const manager = new ExtensionManager({
+                    store: createStore(undefined),
+                    env: { isNode: true },
+                    packageStore: createNodeExtensionPackageStore({ basePath }),
+                });
+                manager.registerAdapter(
+                    EXTENSION_IDS.configHosting,
+                    createConfigHostingAdapter({
+                        stopScheduledJobs: () => {
+                            stops += 1;
+                        },
+                    }),
+                );
+                manager.install(EXTENSION_IDS.configHosting);
+                manager.enable(EXTENSION_IDS.configHosting);
+                const record = manager.getRecord(EXTENSION_IDS.configHosting);
+                fs.appendFileSync(record.entrypoint, '\n// modified\n', 'utf8');
+
+                const tamperedHealth = manager.getHealth(
+                    EXTENSION_IDS.configHosting,
+                );
+                expect(tamperedHealth.status).to.equal('unhealthy');
+                expect(tamperedHealth.packageIntegrity).to.include({
+                    status: 'failed',
+                    code: 'EXTENSION_PACKAGE_FILE_DIGEST_MISMATCH',
+                });
+
+                const result = manager[action](EXTENSION_IDS.configHosting);
+                expect(stops).to.equal(1);
+                expect(
+                    manager.getHealth(EXTENSION_IDS.configHosting).status,
+                ).to.not.equal('healthy');
+                if (action === 'disable') {
+                    expect(result.status).to.equal('disabled');
+                    expect(
+                        manager.getAvailability(EXTENSION_IDS.configHosting)
+                            .status,
+                    ).to.equal('disabled');
+                } else {
+                    expect(result.status).to.equal('reinstall-required');
+                    expect(
+                        manager.getAvailability(EXTENSION_IDS.configHosting)
+                            .status,
+                    ).to.equal('reinstall-required');
+                    expect(fs.existsSync(record.packageDirectory)).to.equal(
+                        false,
+                    );
+                }
+            } finally {
+                fs.rmSync(basePath, { recursive: true, force: true });
+            }
+        };
+
+        exercise('disable');
+        exercise('uninstall');
+    });
+
+    it('keeps the scheduler gate closed when deactivation cleanup throws', function () {
+        const basePath = fs.mkdtempSync(
+            path.join(os.tmpdir(), 'sub-store-extension-stop-failure-'),
+        );
+        try {
+            let schedulerGate;
+            let jobRunning = false;
+            const adapter = createConfigHostingAdapter({
+                startScheduledJobs: ({ isActive }) => {
+                    schedulerGate = isActive;
+                    jobRunning = true;
+                },
+                stopScheduledJobs: () => {
+                    throw new Error('simulated scheduler stop failure');
+                },
+            });
+            const manager = new ExtensionManager({
+                store: createStore(undefined),
+                env: { isNode: true },
+                packageStore: createNodeExtensionPackageStore({ basePath }),
+            });
+            manager.registerAdapter(EXTENSION_IDS.configHosting, adapter);
+            manager.install(EXTENSION_IDS.configHosting);
+            manager.enable(EXTENSION_IDS.configHosting);
+
+            expect(jobRunning).to.equal(true);
+            expect(schedulerGate()).to.equal(true);
+            expect(
+                manager.disable(EXTENSION_IDS.configHosting).status,
+            ).to.equal('disabled');
+            expect(adapter.health().active).to.equal(false);
+            expect(schedulerGate()).to.equal(false);
             expect(
                 manager.getAvailability(EXTENSION_IDS.configHosting).status,
             ).to.equal('disabled');

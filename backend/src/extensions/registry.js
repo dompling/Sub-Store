@@ -3,6 +3,7 @@ import { getExtensionManager } from './manager';
 import { failed } from '@/restful/response';
 
 const extensions = [];
+const routeHosts = [];
 
 function canonicalExtensionId(extension) {
     if (extension?.extensionId) return extension.extensionId;
@@ -31,15 +32,34 @@ export function registerExtension(extension) {
         manifest: extension.manifest || catalogEntry?.manifest || null,
     };
     extensions.push(registered);
-    try {
-        getExtensionManager().registerAdapter(extensionId, registered);
-    } catch (e) {
-        // Registry registration predates the Host. A third-party/fixture
-        // extension may intentionally have no catalog entry; keep its legacy
-        // registration available and let explicit Host registration fail with
-        // a structured error instead of breaking application startup.
+    if (extension.lifecycleAdapter) {
+        getExtensionManager().registerAdapter(
+            extensionId,
+            extension.lifecycleAdapter,
+        );
     }
+    routeHosts.forEach((host) => mountExtensionRoutes(host, registered));
     return registered;
+}
+
+export function unregisterExtension(extensionId) {
+    const canonicalId =
+        extensionId === 'config-generator'
+            ? 'org.substore.config-generator'
+            : extensionId;
+    const index = extensions.findIndex(
+        (extension) => extension.extensionId === canonicalId,
+    );
+    if (index < 0) return false;
+    extensions.splice(index, 1);
+    routeHosts.forEach((host) => {
+        for (const key of host.handlers.keys()) {
+            if (key.startsWith(`${canonicalId}\u0000`)) {
+                host.handlers.delete(key);
+            }
+        }
+    });
+    return true;
 }
 
 export function getArtifactSourceAdapter(type) {
@@ -135,6 +155,7 @@ export function getRegisteredExtension(extensionId) {
 
 export function clearExtensionRegistryForTests() {
     extensions.splice(0, extensions.length);
+    routeHosts.splice(0, routeHosts.length);
 }
 
 export function resolveExtensionRouteLane(extensionId, path) {
@@ -159,7 +180,12 @@ export function resolveExtensionRouteLane(extensionId, path) {
     return 'simple';
 }
 
-function gatedApp($app, extension, manager, executionLane) {
+function routeHandlerKey(extensionId, method, path) {
+    return `${extensionId}\u0000${method}\u0000${path}`;
+}
+
+function dynamicGatedApp(host, extension) {
+    const { app: $app, manager, executionLane } = host;
     const proxy = Object.create($app);
     for (const method of ['get', 'post', 'put', 'patch', 'delete']) {
         if (typeof $app[method] !== 'function') continue;
@@ -171,35 +197,72 @@ function gatedApp($app, extension, manager, executionLane) {
             ) {
                 return proxy;
             }
-            $app[method](path, async (req, res, next) => {
-                try {
-                    // Legacy aliases intentionally do not require the new
-                    // revision header. Availability still changes
-                    // immediately after enable/disable.
-                    manager.guard(extension.extensionId);
-                    return await handler(req, res, next);
-                } catch (error) {
-                    failed(res, error, error.statusCode || 409);
-                    return undefined;
-                }
-            });
+            const key = routeHandlerKey(extension.extensionId, method, path);
+            host.handlers.set(key, handler);
+            if (!host.mounted.has(key)) {
+                $app[method](path, async (req, res, next) => {
+                    try {
+                        // Route dispatchers are permanent, but the active
+                        // handler is looked up for every request. Disabling or
+                        // uninstalling therefore cannot leave a stale closure
+                        // from an old package version callable.
+                        manager.guard(extension.extensionId);
+                        const current = host.handlers.get(key);
+                        if (typeof current !== 'function') {
+                            const error = new Error(
+                                `Extension route ${path} is unavailable`,
+                            );
+                            error.code = 'EXTENSION_ROUTE_UNAVAILABLE';
+                            error.statusCode = 409;
+                            throw error;
+                        }
+                        return await current(req, res, next);
+                    } catch (error) {
+                        failed(res, error, error.statusCode || 409);
+                        return undefined;
+                    }
+                });
+                host.mounted.add(key);
+            }
             return proxy;
         };
     }
     return proxy;
 }
 
+function mountExtensionRoutes(host, extension) {
+    extension.registerRoutes?.(dynamicGatedApp(host, extension), {
+        ...host.dependencies,
+        extensionManager: host.manager,
+    });
+}
+
 export function registerExtensionRoutes($app, dependencies = {}) {
     const manager = dependencies.extensionManager || getExtensionManager();
-    extensions.forEach((extension) =>
-        extension.registerRoutes?.(
-            gatedApp($app, extension, manager, dependencies.executionLane),
-            {
-                ...dependencies,
-                extensionManager: manager,
-            },
-        ),
+    let host = routeHosts.find(
+        (candidate) =>
+            candidate.rootApp === $app &&
+            candidate.executionLane === dependencies.executionLane,
     );
+    if (!host) {
+        const routeApp =
+            typeof $app.createRouter === 'function' &&
+            typeof $app.use === 'function'
+                ? $app.createRouter()
+                : $app;
+        if (routeApp !== $app) $app.use(routeApp);
+        host = {
+            rootApp: $app,
+            app: routeApp,
+            manager,
+            dependencies,
+            executionLane: dependencies.executionLane,
+            handlers: new Map(),
+            mounted: new Set(),
+        };
+        routeHosts.push(host);
+    }
+    extensions.forEach((extension) => mountExtensionRoutes(host, extension));
     if (
         !dependencies.executionLane ||
         dependencies.executionLane === 'simple'

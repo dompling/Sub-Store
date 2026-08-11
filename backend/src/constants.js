@@ -7,10 +7,16 @@ export const MODULES_KEY = 'modules';
 export const ARTIFACTS_KEY = 'artifacts';
 export const CONFIG_GENERATOR_KEY = 'configGenerator';
 // Extension Host state lives in the root/global store so that Node and
-// script-product invocations share the lifecycle revision and receipts.
-// Keep these keys namespaced and versioned; they are intentionally separate
-// from extension-owned business data.
-export const EXTENSIONS_KEY = '#sub-store-extensions';
+// script-product invocations share lifecycle revisions and receipts. Global
+// metadata is indexed separately from extension-owned lifecycle records so a
+// single plugin update does not rewrite every installed plugin.
+export const LEGACY_EXTENSIONS_KEY = '#sub-store-extensions';
+export const EXTENSION_STATE_INDEX_KEY = '#sub-store-extension-index';
+export const EXTENSION_RECORD_KEY_PREFIX = '#sub-store-extension:';
+// Retain the historical import name for callers that only need the current
+// lifecycle state identity. The legacy aggregate key is explicitly named
+// above and is read only by the migration path.
+export const EXTENSIONS_KEY = EXTENSION_STATE_INDEX_KEY;
 export const EXTENSION_CATALOG_KEY = '#sub-store-extension-catalog';
 export const EXTENSION_TASKS_KEY = '#sub-store-extension-tasks';
 export const RULES_KEY = 'rules';

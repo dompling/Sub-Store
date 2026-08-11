@@ -12,6 +12,7 @@ import registerSyncRoutes, { produceBuiltinArtifact } from '@/restful/sync';
 import registerNodeInfoRoutes from '@/restful/node-info';
 import { registerExtensionRoutes } from '@/extensions/registry';
 import { initializeExtensionHost } from '@/extensions/host';
+import { registerEmbeddedConfigGenerator } from '@/extensions/embedded/config-generator';
 import { loadBundledExtensions } from '@/extensions/bundled';
 import { createConfigHostingRouteApps } from '@/extensions/config-hosting';
 
@@ -28,7 +29,9 @@ serve();
 
 function serve() {
     const $app = express({ substore: $ });
-    const { manager: extensionManager } = initializeExtensionHost();
+    const { manager: extensionManager } = initializeExtensionHost({
+        registerEmbeddedExtensions: registerEmbeddedConfigGenerator,
+    });
     loadBundledExtensions(extensionManager);
 
     // register routes

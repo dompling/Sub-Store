@@ -1,5 +1,9 @@
 import { failed, success } from './response';
 import { getExtensionManager } from '@/extensions/manager';
+import {
+    EXTENSION_DIRECTORY_MIME,
+    normalizeExtensionPackageDirectory,
+} from '@/extensions/package-directory';
 
 function envValue(name) {
     try {
@@ -35,9 +39,9 @@ function sha256(value) {
 }
 
 /**
- * Lifecycle mutations are deliberately behind a separate admin boundary.
- * In a default development/runtime build no token is configured, so the
- * control plane is read-only rather than silently trusting loopback/CORS.
+ * Lifecycle mutations can be protected by an optional admin boundary. A Node
+ * Host without a configured token remains directly manageable; deployments
+ * that expose the control plane can opt into bearer-token authentication.
  * Tests and internal migration callers can pass `req.extensionAdmin === true`
  * without exposing that bypass to HTTP clients.
  */
@@ -45,10 +49,11 @@ function assertAdmin(req) {
     if (req?.extensionAdmin === true) return;
     const configuredToken = envValue('SUB_STORE_EXTENSION_ADMIN_TOKEN');
     const configuredHash = envValue('SUB_STORE_EXTENSION_ADMIN_TOKEN_HASH');
+    if (!configuredToken && !configuredHash) return;
     const authorization = req?.headers?.authorization || '';
     const match = authorization.match(/^Bearer\s+(.+)$/i);
     const provided = match?.[1];
-    if (!provided || (!configuredToken && !configuredHash)) {
+    if (!provided) {
         const error = new Error(
             'Extension administrator authentication is required',
         );
@@ -90,6 +95,58 @@ function lifecycleInput(req) {
     };
 }
 
+function assertNoClientPackage(req) {
+    if (!Object.prototype.hasOwnProperty.call(requestPayload(req), 'package')) {
+        return;
+    }
+    const error = new Error(
+        'Package bytes must use the dedicated local package installation route',
+    );
+    error.code = 'EXTENSION_PACKAGE_UPLOAD_ROUTE_REQUIRED';
+    error.statusCode = 400;
+    throw error;
+}
+
+function sourceInput(req) {
+    const body = requestPayload(req);
+    return {
+        url: body.url,
+        name: body.name,
+        expectedRevision:
+            body.expectedRevision ??
+            req.headers?.['x-sub-store-extension-revision'],
+        idempotencyKey:
+            body.idempotencyKey ?? req.headers?.['x-idempotency-key'],
+    };
+}
+
+function requestMediaType(req) {
+    return `${req?.headers?.['content-type'] || ''}`
+        .split(';', 1)[0]
+        .trim()
+        .toLowerCase();
+}
+
+function assertLocalPackageRequest(req, manager) {
+    if (manager.runtime !== 'node') {
+        const error = new Error(
+            'Local extension packages are only supported by the Node runtime',
+        );
+        error.code = 'EXTENSION_LOCAL_PACKAGE_UNSUPPORTED';
+        error.statusCode = 501;
+        error.details = { runtime: manager.runtime };
+        throw error;
+    }
+    if (requestMediaType(req) !== EXTENSION_DIRECTORY_MIME) {
+        const error = new Error(
+            `Content-Type ${EXTENSION_DIRECTORY_MIME} is required`,
+        );
+        error.code = 'EXTENSION_DIRECTORY_MEDIA_TYPE_REQUIRED';
+        error.statusCode = 415;
+        throw error;
+    }
+}
+
 function handle(res, action, successStatus = 200) {
     return Promise.resolve()
         .then(action)
@@ -120,6 +177,14 @@ function notModified(req, res, etag) {
     return false;
 }
 
+function extensionAssetContentType(path) {
+    if (/\.m?js$/i.test(path)) return 'application/javascript; charset=utf-8';
+    if (/\.css$/i.test(path)) return 'text/css; charset=utf-8';
+    if (/\.json$/i.test(path)) return 'application/json; charset=utf-8';
+    if (/\.svg$/i.test(path)) return 'image/svg+xml; charset=utf-8';
+    return 'text/plain; charset=utf-8';
+}
+
 export function registerExtensionControlRoutes(
     $app,
     manager = getExtensionManager(),
@@ -139,6 +204,16 @@ export function registerExtensionControlRoutes(
         const etag = setEtag(res, catalog.sequence);
         if (notModified(req, res, etag)) return;
         success(res, catalog);
+    });
+
+    $app.get('/api/extensions/sources', (req, res) => {
+        const revision = manager.getRuntimeManifest().revision;
+        const etag = setEtag(res, `sources-${revision}`);
+        if (notModified(req, res, etag)) return;
+        success(res, {
+            revision,
+            items: manager.getSources(),
+        });
     });
 
     $app.get('/api/extensions/installed', (req, res) =>
@@ -162,6 +237,36 @@ export function registerExtensionControlRoutes(
         success(res, task);
     });
 
+    $app.get('/api/extensions/:id/assets/*', (req, res) => {
+        const id = decodeURIComponent(req.params.id);
+        const path = `${req.params[0] || ''}`
+            .split('/')
+            .map((segment) => decodeURIComponent(segment))
+            .join('/');
+        try {
+            const asset = manager.getPackageAsset(id, path);
+            const etag = `"sha256-${asset.digest}"`;
+            if (req?.headers?.['if-none-match'] === etag) {
+                res.status(304).end();
+                return;
+            }
+            if (typeof res.set === 'function') {
+                res.set('Content-Type', extensionAssetContentType(asset.path));
+                res.set(
+                    'Cache-Control',
+                    'private, max-age=31536000, immutable',
+                );
+                res.set('ETag', etag);
+                res.set('X-Content-Type-Options', 'nosniff');
+                res.set('X-Sub-Store-Package-Digest', asset.packageDigest);
+                res.set('X-Sub-Store-Asset-Digest', asset.digest);
+            }
+            res.send(asset.content);
+        } catch (error) {
+            failed(res, error, error.statusCode || 409);
+        }
+    });
+
     $app.get('/api/extensions/:id/health', (req, res) => {
         const id = decodeURIComponent(req.params.id);
         const manifest = manager.getManifest(id);
@@ -179,6 +284,8 @@ export function registerExtensionControlRoutes(
                 manifest: 'ok',
                 implementation:
                     health.status === 'healthy' ? 'ok' : 'not-active',
+                packageIntegrity:
+                    health.packageIntegrity?.status || 'not-applicable',
             },
         });
     });
@@ -230,10 +337,85 @@ export function registerExtensionControlRoutes(
             res,
             () => {
                 assertAdmin(req);
-                return manager.install(req.params.id, lifecycleInput(req));
+                assertNoClientPackage(req);
+                const input = lifecycleInput(req);
+                const entry = manager.findEntry(req.params.id);
+                return entry?.distribution === 'community' ||
+                    entry?.remotePackage === true
+                    ? manager.installFromSource(req.params.id, input)
+                    : manager.install(req.params.id, input);
             },
             201,
         ),
+    );
+
+    $app.post('/api/admin/extensions/packages/inspect', (req, res) =>
+        handle(res, () => {
+            assertAdmin(req);
+            assertLocalPackageRequest(req, manager);
+            const normalized = normalizeExtensionPackageDirectory(
+                requestPayload(req),
+            );
+            return {
+                ...normalized.summary,
+                ...manager.inspectLocalPackage(normalized.packageInput),
+            };
+        }),
+    );
+
+    $app.post('/api/admin/extensions/:id/install-local', (req, res) =>
+        handle(
+            res,
+            () => {
+                assertAdmin(req);
+                assertLocalPackageRequest(req, manager);
+                const extensionId = manager.resolveId(
+                    decodeURIComponent(req.params.id),
+                );
+                const normalized = normalizeExtensionPackageDirectory(
+                    requestPayload(req),
+                    { expectedExtensionId: extensionId },
+                );
+                const input = lifecycleInput(req);
+                return manager.install(extensionId, {
+                    ...input,
+                    package: normalized.packageInput,
+                    source: 'local-upload',
+                });
+            },
+            201,
+        ),
+    );
+
+    $app.post('/api/admin/extensions/sources', (req, res) =>
+        handle(
+            res,
+            () => {
+                assertAdmin(req);
+                return manager.addSource(sourceInput(req));
+            },
+            201,
+        ),
+    );
+
+    $app.post('/api/admin/extensions/sources/:id/refresh', (req, res) =>
+        handle(res, () => {
+            assertAdmin(req);
+            return manager.refreshSource(
+                decodeURIComponent(req.params.id),
+                sourceInput(req),
+            );
+        }),
+    );
+
+    $app.delete('/api/admin/extensions/sources/:id', (req, res) =>
+        handle(res, () => {
+            assertAdmin(req);
+            return manager.removeSource(
+                decodeURIComponent(req.params.id),
+                sourceInput(req),
+            );
+        }),
     );
 
     $app.post('/api/admin/extensions/:id/enable', (req, res) =>

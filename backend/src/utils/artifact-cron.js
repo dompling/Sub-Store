@@ -6,6 +6,8 @@ const artifactCronJobs = new Map();
 const runningArtifactCronNames = new Set();
 let syncArtifactByName;
 let artifactCronEnabled = false;
+let artifactCronGeneration = 0;
+let artifactCronActivationCheck = null;
 
 function getArtifactCron(artifact) {
     const cron = artifact?.cron == null ? '' : `${artifact.cron}`.trim();
@@ -64,13 +66,47 @@ function normalizeArtifactCron(artifact) {
     return artifact;
 }
 
-function stopArtifactCronJobs() {
-    artifactCronEnabled = false;
-    artifactCronJobs.forEach((job) => job.stop());
+function stopScheduledArtifactCronInstances() {
+    const errors = [];
+    artifactCronJobs.forEach((job) => {
+        try {
+            job.stop();
+        } catch (error) {
+            errors.push(error);
+        }
+    });
     artifactCronJobs.clear();
+    return errors;
 }
 
-async function runArtifactCron(name, logName, cron) {
+function stopArtifactCronJobs() {
+    artifactCronEnabled = false;
+    artifactCronGeneration += 1;
+    artifactCronActivationCheck = null;
+    const errors = stopScheduledArtifactCronInstances();
+    if (errors.length) {
+        const error = new Error(
+            'One or more artifact cron jobs failed to stop',
+        );
+        error.code = 'ARTIFACT_CRON_STOP_FAILED';
+        error.causes = errors;
+        throw error;
+    }
+}
+
+async function runArtifactCron(name, logName, cron, gate = {}) {
+    const activationCheck = gate.isActive || artifactCronActivationCheck;
+    if (
+        !artifactCronEnabled ||
+        (gate.generation !== undefined &&
+            gate.generation !== artifactCronGeneration) ||
+        (activationCheck && activationCheck() !== true)
+    ) {
+        $.info(
+            `[ARTIFACT CRON] ${logName} ${cron} skipped: extension is inactive`,
+        );
+        return;
+    }
     if (runningArtifactCronNames.has(name)) {
         $.info(
             `[ARTIFACT CRON] ${logName} ${cron} skipped: previous run is still running`,
@@ -90,7 +126,7 @@ async function runArtifactCron(name, logName, cron) {
     }
 }
 
-function scheduleArtifactCron(artifact) {
+function scheduleArtifactCron(artifact, gate) {
     const cron = getArtifactCron(artifact);
     const name = artifact.name;
     const logName = formatArtifactLogName(artifact);
@@ -100,7 +136,7 @@ function scheduleArtifactCron(artifact) {
         const job = new CronJob(
             cron,
             async function () {
-                await runArtifactCron(name, logName, cron);
+                await runArtifactCron(name, logName, cron, gate);
             },
             null,
             true,
@@ -119,20 +155,34 @@ function scheduleArtifactCron(artifact) {
 function refreshArtifactCronJobs() {
     if (!$.env.isNode || !syncArtifactByName || !artifactCronEnabled) return;
 
-    stopArtifactCronJobs();
+    artifactCronGeneration += 1;
+    const gate = {
+        generation: artifactCronGeneration,
+        isActive: artifactCronActivationCheck,
+    };
+    const stopErrors = stopScheduledArtifactCronInstances();
+    stopErrors.forEach((error) => {
+        $.error(
+            `[ARTIFACT CRON] stale schedule stop error: ${
+                error.message ?? error
+            }`,
+        );
+    });
 
     const storedArtifacts = $.read(ARTIFACTS_KEY);
     const artifacts = Array.isArray(storedArtifacts) ? storedArtifacts : [];
     artifacts
         .filter((artifact) => artifact.sync && artifact.source)
         .filter(hasArtifactCron)
-        .forEach(scheduleArtifactCron);
+        .forEach((artifact) => scheduleArtifactCron(artifact, gate));
 }
 
-function startArtifactCronJobs(handler) {
+function startArtifactCronJobs(handler, { isActive } = {}) {
     if (!$.env.isNode) return;
 
     syncArtifactByName = handler;
+    artifactCronActivationCheck =
+        typeof isActive === 'function' ? isActive : null;
     artifactCronEnabled = true;
     refreshArtifactCronJobs();
 }

@@ -1,5 +1,12 @@
 import $ from '@/core/app';
-import { ARTIFACTS_KEY, EXTENSIONS_KEY } from '@/constants';
+import {
+    ARTIFACTS_KEY,
+    CONFIG_GENERATOR_KEY,
+    EXTENSION_RECORD_KEY_PREFIX,
+    EXTENSION_STATE_INDEX_KEY,
+    EXTENSIONS_KEY,
+    LEGACY_EXTENSIONS_KEY,
+} from '@/constants';
 import {
     EXTENSION_HOST_API_VERSION,
     EXTENSION_IDS,
@@ -14,10 +21,12 @@ import {
     embeddedExtensionImplementations,
     findCatalogEntry,
     listCatalogEntries,
+    officialExtensionReleaseKeyIds,
     officialExtensionTrustedKeys,
     signedExtensionCatalog,
 } from './catalog.generated';
 import {
+    createDigestReceipt,
     diagnosticDigest,
     extensionPackageDigest,
     isSha256Digest,
@@ -26,6 +35,17 @@ import {
     verifySignedEnvelope,
 } from './signature';
 import { createNodeExtensionPackageStore } from './package-store';
+import {
+    extensionSourceId,
+    fetchExtensionSourceDocument,
+    isCommunityContentPackage,
+    normalizeCommunityCatalog,
+    normalizeExtensionSourceUrl,
+    publicExtensionSource,
+    sourceEntryPackageDigest,
+    sourceEntryPackageUrl,
+    TRUSTED_OFFICIAL_MIRROR_DISTRIBUTION,
+} from './sources';
 import { version as packageVersion } from '../../package.json';
 
 const STATE_SCHEMA_VERSION = 1;
@@ -33,6 +53,7 @@ const MAX_TASKS = 100;
 const MAX_PACKAGE_FILES = 128;
 const MAX_PACKAGE_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_PACKAGE_BYTES = 8 * 1024 * 1024;
+const MAX_ROLLBACK_VERSIONS = 3;
 const RESERVED_PACKAGE_FILES = new Set([
     'manifest.json',
     'receipt.json',
@@ -40,7 +61,9 @@ const RESERVED_PACKAGE_FILES = new Set([
     'active.json',
 ]);
 const LEGACY_CONFIG_HOSTING_ADOPTION = 'config-hosting-legacy-artifacts-v1';
+const LEGACY_CONFIG_GENERATOR_ADOPTION = 'config-generator-legacy-storage-v1';
 const TRUSTED_OFFICIAL_ALLOWLIST = Object.freeze({
+    [EXTENSION_IDS.configGenerator]: 'org.substore',
     [EXTENSION_IDS.configHosting]: 'org.substore',
 });
 const KNOWN_EXTENSION_PERMISSIONS = Object.freeze([
@@ -140,7 +163,7 @@ function managementMode(env = {}) {
         }
     })();
     if (env.isNode && configuredToken) return 'token';
-    if (env.isNode) return 'read-only';
+    if (env.isNode) return 'open';
     return 'read-only';
 }
 
@@ -221,6 +244,53 @@ function packageFileIsSafe(value) {
     );
 }
 
+function assertVerifiedPackageFiles(files, fileDigests) {
+    if (
+        !files ||
+        typeof files !== 'object' ||
+        Array.isArray(files) ||
+        !fileDigests ||
+        typeof fileDigests !== 'object' ||
+        Array.isArray(fileDigests) ||
+        Object.keys(files).length > MAX_PACKAGE_FILES ||
+        canonicalJson(Object.keys(files).sort()) !==
+            canonicalJson(Object.keys(fileDigests).sort())
+    ) {
+        throw errorWithCode(
+            'EXTENSION_PACKAGE_FILE_DIGEST_MISMATCH',
+            'Package files and file digest map do not match',
+        );
+    }
+    let totalPackageBytes = 0;
+    for (const [relativeName, content] of Object.entries(files)) {
+        const normalizedName = relativeName.replace(/\\/g, '/');
+        const rootName = normalizedName.split('/')[0];
+        const byteLength =
+            typeof content === 'string'
+                ? typeof TextEncoder === 'function'
+                    ? new TextEncoder().encode(content).byteLength
+                    : content.length
+                : Number.POSITIVE_INFINITY;
+        totalPackageBytes += byteLength;
+        if (
+            !packageFileIsSafe(relativeName) ||
+            (normalizedName === rootName &&
+                RESERVED_PACKAGE_FILES.has(rootName.toLowerCase())) ||
+            typeof content !== 'string' ||
+            byteLength > MAX_PACKAGE_FILE_BYTES ||
+            totalPackageBytes > MAX_PACKAGE_BYTES ||
+            !isSha256Digest(fileDigests[relativeName]) ||
+            sha256Hex(content) !== fileDigests[relativeName]
+        ) {
+            throw errorWithCode(
+                'EXTENSION_PACKAGE_FILE_DIGEST_MISMATCH',
+                `Package file failed verification: ${relativeName}`,
+                { file: relativeName },
+            );
+        }
+    }
+}
+
 function defaultConsistency(env = {}) {
     if (env.isNode) {
         return {
@@ -249,6 +319,7 @@ function createEmptyState() {
         storeRevision: 0,
         dataGeneration: 0,
         installed: {},
+        sources: {},
         migrations: {},
         tasks: [],
         audit: [],
@@ -275,6 +346,10 @@ function normalizeState(value) {
             state.installed && typeof state.installed === 'object'
                 ? state.installed
                 : {},
+        sources:
+            state.sources && typeof state.sources === 'object'
+                ? state.sources
+                : {},
         migrations:
             state.migrations && typeof state.migrations === 'object'
                 ? state.migrations
@@ -282,6 +357,59 @@ function normalizeState(value) {
         tasks: Array.isArray(state.tasks) ? state.tasks : [],
         audit: Array.isArray(state.audit) ? state.audit : [],
     };
+}
+
+function extensionRecordKey(extensionId) {
+    return `${EXTENSION_RECORD_KEY_PREFIX}${extensionId}`;
+}
+
+function parseExtensionRecord(value) {
+    const parsed = parseStoredState(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? parsed
+        : null;
+}
+
+function stateIndexParts(value) {
+    const parsed = parseStoredState(value);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return {
+            state: createEmptyState(),
+            extensionIds: [],
+            exists: false,
+        };
+    }
+    const { extensionIds, ...metadata } = parsed;
+    delete metadata.installed;
+    return {
+        state: normalizeState({ ...metadata, installed: {} }),
+        extensionIds: Array.isArray(extensionIds)
+            ? extensionIds.filter(
+                  (extensionId) =>
+                      typeof extensionId === 'string' && extensionId,
+              )
+            : [],
+        exists: true,
+    };
+}
+
+function stateIndexFromState(state) {
+    const normalized = normalizeState(state);
+    const { installed, ...metadata } = normalized;
+    return {
+        ...metadata,
+        extensionIds: Object.keys(installed).sort(),
+    };
+}
+
+function extensionIdsFromSources(sources = {}) {
+    const ids = [];
+    for (const source of Object.values(sources || {})) {
+        for (const entry of source?.entries || []) {
+            if (typeof entry?.id === 'string' && entry.id) ids.push(entry.id);
+        }
+    }
+    return ids;
 }
 
 function stateRecordFromBundled(entry) {
@@ -359,12 +487,189 @@ function errorWithCode(code, message, details) {
     return error;
 }
 
+function isVerifiedRollbackSnapshot(record) {
+    return Boolean(
+        record?.packageDigest && record?.packageDirectory && record?.entrypoint,
+    );
+}
+
+function verifiedRollbackHistory(record) {
+    return (
+        Array.isArray(record?.rollbackHistory) ? record.rollbackHistory : []
+    ).filter(isVerifiedRollbackSnapshot);
+}
+
 function publicRecord(record) {
     if (!record) return null;
     const result = clone(record);
     delete result.packageDirectory;
     delete result.entrypoint;
+    result.rollbackHistory = verifiedRollbackHistory(result).map((snapshot) => {
+        const publicSnapshot = clone(snapshot);
+        delete publicSnapshot.packageDirectory;
+        delete publicSnapshot.entrypoint;
+        return publicSnapshot;
+    });
+    result.rollbackVersions = result.rollbackHistory.map(
+        (snapshot) => snapshot.version,
+    );
+    result.rollbackAvailable = result.rollbackHistory.length > 0;
     return result;
+}
+
+function rollbackSnapshot(record) {
+    if (!record) return null;
+    const snapshot = clone(record);
+    delete snapshot.rollbackHistory;
+    delete snapshot.rollbackVersions;
+    delete snapshot.rollbackAvailable;
+    delete snapshot.lifecycleStatus;
+    delete snapshot.taskId;
+    delete snapshot.cleanupError;
+    return snapshot;
+}
+
+function appendRollbackSnapshot(history, record) {
+    const snapshot = rollbackSnapshot(record);
+    const next = verifiedRollbackHistory({
+        rollbackHistory: Array.isArray(history) ? clone(history) : [],
+    });
+    if (!isVerifiedRollbackSnapshot(snapshot)) {
+        return next.slice(-MAX_ROLLBACK_VERSIONS);
+    }
+    const withoutDuplicate = next.filter(
+        (candidate) => candidate.packageDigest !== snapshot.packageDigest,
+    );
+    return [...withoutDuplicate, snapshot].slice(-MAX_ROLLBACK_VERSIONS);
+}
+
+function packageVersionIdentity(record) {
+    if (
+        !record?.extensionId ||
+        !record?.version ||
+        !record?.packageDigest ||
+        !record?.packageDirectory
+    ) {
+        return null;
+    }
+    return [
+        record.extensionId,
+        record.version,
+        record.packageDigest,
+        record.packageDirectory,
+    ].join('\u0000');
+}
+
+function cleanupObsoleteVersionPackages(
+    packageStore,
+    previousRecord,
+    currentRecord,
+) {
+    if (!packageStore?.removeVersion || !previousRecord || !currentRecord) {
+        return null;
+    }
+    const retained = new Set(
+        [currentRecord, ...(currentRecord.rollbackHistory || [])]
+            .map(packageVersionIdentity)
+            .filter(Boolean),
+    );
+    const seen = new Set();
+    const failures = [];
+    for (const candidate of [
+        ...(previousRecord.rollbackHistory || []),
+        previousRecord,
+    ]) {
+        const identity = packageVersionIdentity(candidate);
+        if (!identity || retained.has(identity) || seen.has(identity)) continue;
+        seen.add(identity);
+        try {
+            packageStore.removeVersion(candidate);
+        } catch (error) {
+            failures.push({
+                version: candidate.version,
+                packageDigest: candidate.packageDigest,
+                code: error.code || 'EXTENSION_PACKAGE_CLEANUP_FAILED',
+                message: error.message,
+            });
+        }
+    }
+    if (failures.length === 0) return null;
+    return {
+        code: 'EXTENSION_PACKAGE_CLEANUP_FAILED',
+        message: `Failed to clean ${failures.length} obsolete extension package version(s)`,
+        failures,
+    };
+}
+
+function catalogManifest(entry) {
+    return entry ? normalizeExtensionManifest(entry.manifest || entry) : null;
+}
+
+function preferCatalogEntry(current, candidate) {
+    if (!current) return candidate;
+    if (!candidate) return current;
+    const currentManifest = catalogManifest(current);
+    const candidateManifest = catalogManifest(candidate);
+    const comparison = compareVersions(
+        candidateManifest?.version,
+        currentManifest?.version,
+    );
+    if (comparison === 1) return candidate;
+    if (comparison === -1) return current;
+    if (candidate.remotePackage === true || candidate.sourceId)
+        return candidate;
+    return current;
+}
+
+function assertImmutableSourceVersions(previousEntries, nextEntries) {
+    const previousByVersion = new Map(
+        (previousEntries || []).map((entry) => [
+            catalogEntryKey(entry.id, entry.version),
+            entry,
+        ]),
+    );
+    for (const nextEntry of nextEntries || []) {
+        const previousEntry = previousByVersion.get(
+            catalogEntryKey(nextEntry.id, nextEntry.version),
+        );
+        if (!previousEntry) continue;
+        const previousManifestDigest =
+            previousEntry.manifestDigest ||
+            sha256Hex(
+                canonicalJson(
+                    normalizeExtensionManifest(
+                        previousEntry.manifest || previousEntry,
+                    ),
+                ),
+            );
+        const nextManifestDigest =
+            nextEntry.manifestDigest ||
+            sha256Hex(
+                canonicalJson(
+                    normalizeExtensionManifest(nextEntry.manifest || nextEntry),
+                ),
+            );
+        if (
+            previousManifestDigest !== nextManifestDigest ||
+            canonicalJson(previousEntry.packageDigests || {}) !==
+                canonicalJson(nextEntry.packageDigests || {})
+        ) {
+            throw errorWithCode(
+                'EXTENSION_SOURCE_VERSION_MUTATED',
+                'An extension source changed immutable content for an existing version',
+                {
+                    extensionId: nextEntry.id,
+                    version: nextEntry.version,
+                    previousManifestDigest,
+                    nextManifestDigest,
+                    previousPackageDigests: clone(
+                        previousEntry.packageDigests || {},
+                    ),
+                    nextPackageDigests: clone(nextEntry.packageDigests || {}),
+                },
+            );
+        }
+    }
 }
 
 function catalogEntryKey(id, version) {
@@ -465,12 +770,14 @@ export class ExtensionManager {
         persistDefaults = false,
         allowDigestOnly,
         trustedKeys,
+        trustedOfficialKeyIds = officialExtensionReleaseKeyIds,
         revokedKeyIds = [],
         backendVersion = packageVersion,
         hostCapabilities = DEFAULT_EXTENSION_HOST_CAPABILITIES,
         trustedOfficialAllowlist = TRUSTED_OFFICIAL_ALLOWLIST,
         knownPermissions = KNOWN_EXTENSION_PERMISSIONS,
         packageStore,
+        sourceFetcher,
     } = {}) {
         this.store = store;
         this.env = env || {};
@@ -478,6 +785,7 @@ export class ExtensionManager {
         this.backendVersion = backendVersion;
         this.hostCapabilities = clone(hostCapabilities || {});
         this.trustedOfficialAllowlist = clone(trustedOfficialAllowlist || {});
+        this.trustedOfficialKeyIds = clone(trustedOfficialKeyIds || {});
         this.knownPermissions = new Set(knownPermissions || []);
         this.bundledCatalog =
             bundledCatalog ||
@@ -503,6 +811,15 @@ export class ExtensionManager {
             revokedKeyIds: [...(revokedKeyIds || [])],
         };
         this.adapters = new Map();
+        this.hostBindings = {};
+        // Runtime entrypoints are verified once during activation and retained
+        // only for the lifetime of this Host process. Deactivation must never
+        // reload executable code from disk: the package may have been removed
+        // or tampered with after it became active.
+        this.activeRuntimeModules = new Map();
+        // This in-memory gate is the last fail-closed boundary when lifecycle
+        // persistence or package cleanup fails after deactivation has started.
+        this.runtimeGateBlocks = new Map();
         this.persistDefaults = persistDefaults;
         this.packageStore =
             packageStore === undefined && this.env.isNode && this.store === $
@@ -510,6 +827,9 @@ export class ExtensionManager {
                       verificationOptions: this.verificationOptions,
                   })
                 : packageStore || null;
+        // Tests and embedders may provide a bounded fetch implementation. The
+        // production Node path uses the guarded fetcher from sources.js.
+        this.sourceFetcher = sourceFetcher || null;
         const storageIdentitySeed =
             this.packageStore?.rootPath ||
             this.store?.identity ||
@@ -566,6 +886,18 @@ export class ExtensionManager {
         return this.adapters.get(extensionId);
     }
 
+    unregisterAdapter(extensionId, adapter) {
+        const canonicalId = this.resolveId(extensionId);
+        const current = this.adapters.get(canonicalId);
+        if (adapter && current !== adapter) return false;
+        return this.adapters.delete(canonicalId);
+    }
+
+    setHostBindings(bindings = {}) {
+        this.hostBindings = { ...this.hostBindings, ...bindings };
+        return this.hostBindings;
+    }
+
     registerManifest(manifest, adapter, options = {}) {
         const normalized = normalizeExtensionManifest(manifest);
         const existing = this.findEntry(normalized.id);
@@ -617,19 +949,46 @@ export class ExtensionManager {
 
     findEntry(extensionId) {
         const canonicalId = this.resolveId(extensionId);
-        return (
-            this.bundledCatalog.find(
-                (entry) =>
-                    entry.id === canonicalId ||
-                    entry.manifest?.id === canonicalId,
-            ) ||
-            this.officialCatalog.find(
-                (entry) =>
-                    entry.id === canonicalId ||
-                    entry.manifest?.id === canonicalId,
-            ) ||
-            findCatalogEntry(canonicalId)
+        const state = this.readState();
+        const builtInEntries = [
+            ...this.bundledCatalog,
+            ...this.officialCatalog,
+            findCatalogEntry(canonicalId),
+        ].filter(
+            (entry) =>
+                entry &&
+                (entry.id === canonicalId ||
+                    entry.manifest?.id === canonicalId),
         );
+        const sourceEntries = Object.values(state.sources || {}).flatMap(
+            (source) =>
+                (source.entries || []).filter(
+                    (candidate) => candidate.id === canonicalId,
+                ),
+        );
+        const selected = [...builtInEntries, ...sourceEntries].reduce(
+            preferCatalogEntry,
+            null,
+        );
+        if (selected) {
+            const result = clone(selected);
+            if (result.distribution === TRUSTED_OFFICIAL_MIRROR_DISTRIBUTION) {
+                result.remotePackage = true;
+            }
+            return result;
+        }
+        const retained = state.installed?.[canonicalId];
+        return retained?.manifestSnapshot
+            ? {
+                  id: canonicalId,
+                  manifest: clone(retained.manifestSnapshot),
+                  distribution: 'community',
+                  source: retained.sourceUrl || null,
+                  sourceId: retained.sourceId || null,
+                  packageUrls: clone(retained.packageUrls || {}),
+                  packageDigests: clone(retained.packageDigests || {}),
+              }
+            : null;
     }
 
     resolveId(extensionId) {
@@ -641,14 +1000,55 @@ export class ExtensionManager {
     }
 
     getManifest(extensionId) {
-        const entry = this.findEntry(extensionId);
+        const canonicalId = this.resolveId(extensionId);
+        const installed = this.readState().installed?.[canonicalId];
+        if (
+            installed?.installationStatus === 'installed' &&
+            installed.manifestSnapshot
+        ) {
+            return normalizeExtensionManifest(installed.manifestSnapshot);
+        }
+        const entry = this.findEntry(canonicalId);
         return entry
             ? normalizeExtensionManifest(entry.manifest || entry)
             : null;
     }
 
     readState() {
-        const state = normalizeState(this.store.read(EXTENSIONS_KEY));
+        const index = stateIndexParts(
+            this.store.read(EXTENSION_STATE_INDEX_KEY),
+        );
+        const legacyValue = this.store.read(LEGACY_EXTENSIONS_KEY);
+        const legacyParsed = parseStoredState(legacyValue);
+        const legacyState = legacyParsed ? normalizeState(legacyParsed) : null;
+        const useLegacyMetadata =
+            legacyState &&
+            (!index.exists || legacyState.revision > index.state.revision);
+        const state = normalizeState(
+            useLegacyMetadata ? legacyState : index.state,
+        );
+        state.installed = {};
+
+        const knownExtensionIds = new Set([
+            ...index.extensionIds,
+            ...Object.keys(legacyState?.installed || {}),
+            ...extensionIdsFromSources(state.sources),
+            ...this.bundledCatalog.map((entry) => (entry.manifest || entry).id),
+            ...this.officialCatalog.map(
+                (entry) => (entry.manifest || entry).id,
+            ),
+        ]);
+        for (const extensionId of knownExtensionIds) {
+            const storedRecord = parseExtensionRecord(
+                this.store.read(extensionRecordKey(extensionId)),
+            );
+            const legacyRecord = legacyState?.installed?.[extensionId];
+            if (storedRecord || legacyRecord) {
+                state.installed[extensionId] = clone(
+                    storedRecord || legacyRecord,
+                );
+            }
+        }
         for (const entry of this.bundledCatalog) {
             const manifest = entry.manifest || entry;
             if (!state.installed[manifest.id]) {
@@ -662,7 +1062,6 @@ export class ExtensionManager {
             for (const entry of this.officialCatalog) {
                 const manifest = entry.manifest || entry;
                 if (
-                    manifest.id === EXTENSION_IDS.configHosting &&
                     !state.installed[manifest.id] &&
                     embeddedExtensionImplementations[manifest.id]
                 ) {
@@ -673,14 +1072,65 @@ export class ExtensionManager {
                 }
             }
         }
+        if (legacyState) this._migrateLegacyState(state);
         return state;
     }
 
-    persistState(state) {
+    _deleteStoreKey(key) {
+        if (typeof this.store.delete === 'function') {
+            this.store.delete(key);
+            return;
+        }
+        this.store.write(null, key);
+    }
+
+    _migrateLegacyState(state) {
         const normalized = normalizeState(state);
-        // Root stores in script hosts historically accept a serialized value;
-        // Node's OpenAPI adapter parses both forms on the next read.
-        this.store.write(JSON.stringify(normalized), EXTENSIONS_KEY);
+        for (const extensionId of Object.keys(normalized.installed).sort()) {
+            this.store.write(
+                JSON.stringify(normalized.installed[extensionId]),
+                extensionRecordKey(extensionId),
+            );
+        }
+        this.store.write(
+            JSON.stringify(stateIndexFromState(normalized)),
+            EXTENSION_STATE_INDEX_KEY,
+        );
+        this._deleteStoreKey(LEGACY_EXTENSIONS_KEY);
+    }
+
+    persistState(state, { previousState } = {}) {
+        const normalized = normalizeState(state);
+        const previous = previousState
+            ? normalizeState(previousState)
+            : createEmptyState();
+        const nextIds = Object.keys(normalized.installed).sort();
+        const previousIds = new Set(Object.keys(previous.installed));
+
+        for (const extensionId of nextIds) {
+            const nextRecord = normalized.installed[extensionId];
+            const previousRecord = previous.installed[extensionId];
+            const recordMissing =
+                this.store.read(extensionRecordKey(extensionId)) === undefined;
+            if (
+                recordMissing ||
+                canonicalJson(previousRecord) !== canonicalJson(nextRecord)
+            ) {
+                this.store.write(
+                    JSON.stringify(nextRecord),
+                    extensionRecordKey(extensionId),
+                );
+            }
+            previousIds.delete(extensionId);
+        }
+
+        this.store.write(
+            JSON.stringify(stateIndexFromState(normalized)),
+            EXTENSION_STATE_INDEX_KEY,
+        );
+        for (const removedExtensionId of previousIds) {
+            this._deleteStoreKey(extensionRecordKey(removedExtensionId));
+        }
         return normalized;
     }
 
@@ -703,7 +1153,7 @@ export class ExtensionManager {
         next.revision = current.revision + 1;
         next.storeRevision = next.revision;
         next.updatedAt = now();
-        this.persistState(next);
+        this.persistState(next, { previousState: current });
         const committed = this.readState();
         if (
             Number(committed.revision) !== Number(next.revision) ||
@@ -730,10 +1180,24 @@ export class ExtensionManager {
 
     getAvailability(extensionId) {
         const canonicalId = this.resolveId(extensionId);
-        return extensionAvailability(
+        return this._runtimeAvailability(
             this.readState().installed[canonicalId],
             canonicalId,
         );
+    }
+
+    _runtimeAvailability(record, extensionId) {
+        const availability = extensionAvailability(record, extensionId);
+        const gateBlock = this.runtimeGateBlocks.get(extensionId);
+        if (!gateBlock || availability.status !== 'enabled') {
+            return availability;
+        }
+        return {
+            status: 'disabled',
+            extensionId,
+            reasonCode: gateBlock.reasonCode || 'EXTENSION_DISABLED',
+            failClosed: true,
+        };
     }
 
     getRecord(extensionId) {
@@ -744,8 +1208,10 @@ export class ExtensionManager {
     getHealth(extensionId) {
         const canonicalId = this.resolveId(extensionId);
         const availability = this.getAvailability(canonicalId);
+        const record = this.getRecord(canonicalId);
         let implementation = null;
         let implementationError = null;
+        let packageIntegrity = null;
         try {
             implementation = clone(
                 this.adapters.get(canonicalId)?.health?.() || null,
@@ -756,24 +1222,162 @@ export class ExtensionManager {
                 message: error.message,
             };
         }
+        if (record?.entrypoint && this.packageStore) {
+            try {
+                const verified =
+                    this.packageStore.verifyInstalledRecord(record);
+                packageIntegrity = {
+                    status: 'verified',
+                    packageDigest: verified.packageMetadata.packageDigest,
+                    fileCount: Object.keys(
+                        verified.packageMetadata.fileDigests || {},
+                    ).length,
+                };
+            } catch (error) {
+                packageIntegrity = {
+                    status: 'failed',
+                    code:
+                        error.code ||
+                        'EXTENSION_PACKAGE_INTEGRITY_CHECK_FAILED',
+                    message: error.message,
+                };
+            }
+        }
         const activeMismatch =
             availability.status === 'enabled' &&
             implementation &&
             implementation.active === false;
+        const packageIntegrityFailed = packageIntegrity?.status === 'failed';
         return {
             extensionId: canonicalId,
             status:
                 availability.status === 'enabled' &&
                 !implementationError &&
-                !activeMismatch
+                !activeMismatch &&
+                !packageIntegrityFailed
                     ? 'healthy'
-                    : implementationError || activeMismatch
+                    : implementationError ||
+                      activeMismatch ||
+                      packageIntegrityFailed
                     ? 'unhealthy'
                     : availability.status,
             availability,
             implementation,
+            packageIntegrity,
             error: implementationError,
         };
+    }
+
+    getPackageAsset(extensionId, relativePath) {
+        const canonicalId = this.resolveId(extensionId);
+        this.guard(canonicalId);
+        const record = this.getRecord(canonicalId);
+        if (!record?.entrypoint || !this.packageStore) {
+            throw errorWithCode(
+                'EXTENSION_PACKAGE_ASSET_UNAVAILABLE',
+                `Extension ${canonicalId} has no installed package assets`,
+                { extensionId: canonicalId },
+            );
+        }
+        const manifest = this.getManifest(canonicalId);
+        const frontend = manifest?.frontend || {};
+        const declaredAssets = new Set(
+            [
+                frontend.entrypoint,
+                frontend.style,
+                ...Object.values(frontend.locales || {}),
+                ...Object.values(frontend.assets || {}).map((asset) =>
+                    typeof asset === 'string' ? asset : asset?.path,
+                ),
+            ].filter(Boolean),
+        );
+        if (!declaredAssets.has(relativePath)) {
+            const error = errorWithCode(
+                'EXTENSION_PACKAGE_ASSET_NOT_DECLARED',
+                `Extension asset ${relativePath} is not declared by its manifest`,
+                { extensionId: canonicalId, path: relativePath },
+            );
+            error.statusCode = 404;
+            throw error;
+        }
+        return this.packageStore.readVerifiedFile(record, relativePath);
+    }
+
+    _catalogEntries(state = this.readState()) {
+        const result = [];
+        const seen = new Set();
+        const indexes = new Map();
+        const append = (entry) => {
+            const manifest = entry?.manifest || entry;
+            if (!manifest?.id) return;
+            const key = catalogEntryKey(manifest.id, manifest.version);
+            if (seen.has(key)) {
+                if (
+                    entry.distribution === TRUSTED_OFFICIAL_MIRROR_DISTRIBUTION
+                ) {
+                    const index = indexes.get(key);
+                    const existing = result[index];
+                    const existingManifest = existing?.manifest || existing;
+                    if (
+                        existing &&
+                        canonicalJson(existingManifest) ===
+                            canonicalJson(manifest)
+                    ) {
+                        result[index] = {
+                            ...existing,
+                            source: entry.source,
+                            sourceId: entry.sourceId,
+                            sourceName: entry.sourceName,
+                            packageUrls: clone(entry.packageUrls || {}),
+                            packageDigests: clone(entry.packageDigests || {}),
+                            selectedVariant: entry.selectedVariant,
+                            remotePackage: true,
+                        };
+                    }
+                }
+                return;
+            }
+            seen.add(key);
+            indexes.set(key, result.length);
+            result.push({ ...clone(entry), manifest: clone(manifest) });
+        };
+        [...this.bundledCatalog, ...this.officialCatalog].forEach(append);
+        Object.values(state.sources || {}).forEach((source) =>
+            (source.entries || []).forEach(append),
+        );
+        // A source can disappear after an installation. Keep the immutable
+        // manifest/package projection attached to the receipt so the user can
+        // still inspect, disable and uninstall the retained extension.
+        Object.values(state.installed || {}).forEach((record) => {
+            if (!record?.manifestSnapshot) return;
+            append({
+                id: record.extensionId,
+                manifest: record.manifestSnapshot,
+                distribution: record.distribution || 'community',
+                source: record.sourceUrl || null,
+                sourceId: record.sourceId || null,
+                sourceName: record.sourceName || null,
+                packageUrls: record.packageUrls || {},
+                packageDigests: record.packageDigests || {},
+                sourceMissing: Boolean(
+                    record.sourceId && !state.sources?.[record.sourceId],
+                ),
+            });
+        });
+        return result;
+    }
+
+    _latestCatalogEntries(state = this.readState()) {
+        const byId = new Map();
+        for (const entry of this._catalogEntries(state)) {
+            const manifest = entry?.manifest || entry;
+            if (!manifest?.id) continue;
+            byId.set(
+                manifest.id,
+                preferCatalogEntry(byId.get(manifest.id), entry),
+            );
+        }
+        return [...byId.values()];
     }
 
     getRuntimeManifest() {
@@ -781,24 +1385,44 @@ export class ExtensionManager {
         const consistency = defaultConsistency(this.env);
         const currentManagementMode = managementMode(this.env);
         const restoreIsolation = defaultRestoreIsolation(this.env);
-        const entries = [...this.bundledCatalog, ...this.officialCatalog];
+        const entries = this._latestCatalogEntries(state);
         const extensions = entries.map((entry) => {
-            const manifest = normalizeExtensionManifest(
+            const availableManifest = normalizeExtensionManifest(
                 entry.manifest || entry,
             );
-            const record = state.installed[manifest.id];
-            const availability = extensionAvailability(record, manifest.id);
+            const record = state.installed[availableManifest.id];
+            const manifest =
+                record?.installationStatus === 'installed' &&
+                record.manifestSnapshot
+                    ? normalizeExtensionManifest(record.manifestSnapshot)
+                    : availableManifest;
+            const availability = this._runtimeAvailability(record, manifest.id);
+            const versionComparison = record
+                ? compareVersions(availableManifest.version, record.version)
+                : null;
             return {
                 id: manifest.id,
                 version: manifest.version,
+                availableVersion: availableManifest.version,
+                updateAvailable:
+                    record?.installationStatus === 'installed' &&
+                    entry.sourceMissing !== true &&
+                    versionComparison === 1,
+                rollbackAvailable: verifiedRollbackHistory(record).length > 0,
+                rollbackVersions: verifiedRollbackHistory(record).map(
+                    (snapshot) => snapshot.version,
+                ),
                 name: manifest.name,
                 kind: manifest.kind,
-                distribution: manifest.distribution,
+                distribution: entry.distribution || manifest.distribution,
+                sourceId: entry.sourceId || null,
+                sourceName: entry.sourceName || null,
+                sourceMissing: entry.sourceMissing === true,
                 manifest: clone(manifest),
                 manifestDigest: record?.manifestDigest || null,
                 status: availability.status,
                 availability,
-                enabled: record?.enabled === true,
+                enabled: availability.status === 'enabled',
                 installationStatus:
                     record?.installationStatus || 'never-installed',
                 dataStatus: record?.dataStatus || 'none',
@@ -849,33 +1473,102 @@ export class ExtensionManager {
     }
 
     getCatalog() {
-        const entries = [...this.bundledCatalog, ...this.officialCatalog];
+        const state = this.readState();
+        const entries = this._latestCatalogEntries(state).sort(
+            (left, right) => {
+                const leftManifest = catalogManifest(left);
+                const rightManifest = catalogManifest(right);
+                const idComparison = leftManifest.id.localeCompare(
+                    rightManifest.id,
+                );
+                if (idComparison) return idComparison;
+                return (
+                    compareVersions(
+                        leftManifest.version,
+                        rightManifest.version,
+                    ) || 0
+                );
+            },
+        );
+        const latestById = new Map(
+            this._latestCatalogEntries(state).map((entry) => [
+                catalogManifest(entry).id,
+                entry,
+            ]),
+        );
         const projectedEntries = entries.map((entry) => {
             const manifest = normalizeExtensionManifest(
                 entry.manifest || entry,
             );
+            const record = state.installed[manifest.id];
+            const catalogSource = entry.sourceId
+                ? state.sources?.[entry.sourceId]
+                : null;
             const manifestDigest = sha256Hex(canonicalJson(manifest));
             const authorization = this.catalogAuthorizations.get(
                 catalogEntryKey(manifest.id, manifest.version),
             );
+            let trustedSourceAuthorized = false;
+            if (
+                entry.distribution === TRUSTED_OFFICIAL_MIRROR_DISTRIBUTION &&
+                catalogSource?.verified === true
+            ) {
+                try {
+                    this._assertTrustedOfficialSourceManifest(manifest);
+                    trustedSourceAuthorized = true;
+                } catch (e) {
+                    trustedSourceAuthorized = false;
+                }
+            }
             const catalogAuthorized = Boolean(
-                authorization &&
-                    manifestDigest &&
-                    authorization.manifestDigest === manifestDigest,
+                entry.distribution === 'community'
+                    ? entry.sourceMissing === true ||
+                          (entry.sourceId &&
+                              state.sources?.[entry.sourceId]?.verified ===
+                                  true &&
+                              entry.manifestDigest === manifestDigest)
+                    : trustedSourceAuthorized ||
+                          (authorization &&
+                              manifestDigest &&
+                              authorization.manifestDigest === manifestDigest),
             );
+            const versionComparison = record
+                ? compareVersions(manifest.version, record.version)
+                : null;
+            const latestEntry = latestById.get(manifest.id);
+            const latestManifest = catalogManifest(latestEntry);
             return {
                 ...clone(manifest),
                 id: manifest.id,
                 manifest: clone(manifest),
                 distribution:
                     entry.distribution || manifest.distribution || 'bundled',
-                source: entry.source,
+                source: entry.source || catalogSource?.url || null,
+                sourceUrl: entry.source || catalogSource?.url || null,
+                sourceId: entry.sourceId || null,
+                sourceName: entry.sourceName || catalogSource?.name || null,
+                sourceMissing: entry.sourceMissing === true,
                 defaultEnabled: entry.defaultEnabled === true,
                 manifestDigest,
+                packageUrls: clone(entry.packageUrls || {}),
                 packageDigests: clone(
                     authorization?.packageDigests || entry.packageDigests || {},
                 ),
                 catalogAuthorized,
+                installed: record?.installationStatus === 'installed',
+                installedVersion: record?.version || null,
+                availableVersion: latestManifest?.version || manifest.version,
+                updateAvailable:
+                    record?.installationStatus === 'installed' &&
+                    entry.sourceMissing !== true &&
+                    versionComparison === 1,
+                rollbackAvailable: verifiedRollbackHistory(record).length > 0,
+                rollbackVersions: verifiedRollbackHistory(record).map(
+                    (snapshot) => snapshot.version,
+                ),
+                latest:
+                    latestManifest?.version === manifest.version &&
+                    latestManifest?.id === manifest.id,
             };
         });
         const catalogClosed = projectedEntries.every(
@@ -892,7 +1585,311 @@ export class ExtensionManager {
                 ...clone(this.catalogVerification),
                 catalogClosed,
             },
+            sources: this.getSources(),
             entries: projectedEntries,
+        };
+    }
+
+    getSources() {
+        return Object.values(this.readState().sources || {}).map((source) =>
+            publicExtensionSource(source),
+        );
+    }
+
+    _findSource(sourceId) {
+        return this.readState().sources?.[sourceId] || null;
+    }
+
+    _assertSourceRevision(expectedRevision) {
+        if (expectedRevision === undefined || expectedRevision === null) return;
+        const currentRevision = this.readState().revision;
+        if (Number(expectedRevision) !== Number(currentRevision)) {
+            throw errorWithCode(
+                'EXTENSION_CONSISTENCY_CONFLICT',
+                'Extension state changed; reload before retrying',
+                {
+                    expectedRevision: Number(expectedRevision),
+                    currentRevision,
+                },
+            );
+        }
+    }
+
+    _assertCommunityIdAvailable(entries, sourceId) {
+        const builtInIds = new Set(
+            [...this.bundledCatalog, ...this.officialCatalog].map(
+                (entry) => (entry.manifest || entry).id,
+            ),
+        );
+        const seen = new Set();
+        for (const entry of entries || []) {
+            if (seen.has(entry.id)) {
+                throw errorWithCode(
+                    'EXTENSION_SOURCE_ENTRY_DUPLICATE',
+                    `Community source contains duplicate extension ${entry.id}`,
+                    { extensionId: entry.id },
+                );
+            }
+            seen.add(entry.id);
+            if (entry.distribution === TRUSTED_OFFICIAL_MIRROR_DISTRIBUTION) {
+                const manifest = normalizeExtensionManifest(
+                    entry.manifest || entry,
+                );
+                this._assertTrustedOfficialSourceManifest(manifest, {
+                    selectedVariant: entry.selectedVariant,
+                    packageDigest: sourceEntryPackageDigest(
+                        entry,
+                        entry.selectedVariant,
+                    ),
+                });
+                const conflictingSource = Object.values(
+                    this.readState().sources || {},
+                ).find(
+                    (source) =>
+                        source.id !== sourceId &&
+                        (source.entries || []).some(
+                            (candidate) =>
+                                candidate.id === entry.id &&
+                                candidate.distribution ===
+                                    TRUSTED_OFFICIAL_MIRROR_DISTRIBUTION,
+                        ),
+                );
+                if (conflictingSource) {
+                    throw errorWithCode(
+                        'EXTENSION_SOURCE_ID_CONFLICT',
+                        `Official extension ${entry.id} is already mirrored by another source`,
+                        {
+                            extensionId: entry.id,
+                            existingSourceId: conflictingSource.id,
+                            sourceId,
+                        },
+                    );
+                }
+                continue;
+            }
+            if (builtInIds.has(entry.id)) {
+                throw errorWithCode(
+                    'EXTENSION_SOURCE_ID_RESERVED',
+                    `Community source cannot replace built-in extension ${entry.id}`,
+                    { extensionId: entry.id },
+                );
+            }
+            const existing = this.findEntry(entry.id);
+            if (existing && existing.distribution !== 'community') {
+                throw errorWithCode(
+                    'EXTENSION_SOURCE_ID_RESERVED',
+                    `Community source cannot replace extension ${entry.id}`,
+                    { extensionId: entry.id },
+                );
+            }
+            if (
+                existing?.distribution === 'community' &&
+                existing.sourceId !== sourceId
+            ) {
+                throw errorWithCode(
+                    'EXTENSION_SOURCE_ID_CONFLICT',
+                    `Community extension ${entry.id} is already provided by another source`,
+                    {
+                        extensionId: entry.id,
+                        existingSourceId: existing.sourceId || null,
+                        sourceId,
+                    },
+                );
+            }
+        }
+    }
+
+    async _loadCommunitySource(url, sourceId) {
+        const fetched = await fetchExtensionSourceDocument(url, {
+            fetcher: this.sourceFetcher,
+        });
+        const catalog = normalizeCommunityCatalog(
+            fetched.document,
+            fetched.url,
+            sourceId,
+        );
+        this._assertCommunityIdAvailable(catalog.entries, sourceId);
+        return {
+            ...catalog,
+            url: fetched.url,
+            digest: fetched.digest,
+            headers: fetched.headers,
+            verified: true,
+            verificationMode: 'community-integrity',
+        };
+    }
+
+    async addSource({ url, name, expectedRevision, idempotencyKey } = {}) {
+        if (!this.env.isNode) {
+            throw errorWithCode(
+                'EXTENSION_SOURCE_MANAGEMENT_UNSUPPORTED',
+                'Community extension sources are only available on the Node Host',
+            );
+        }
+        this._assertSourceRevision(expectedRevision);
+        const normalizedUrl = normalizeExtensionSourceUrl(url);
+        const sourceId = extensionSourceId(normalizedUrl);
+        const current = this.readState();
+        const existing = current.sources?.[sourceId];
+        if (existing && existing.lastIdempotencyKey === idempotencyKey) {
+            return publicExtensionSource(existing);
+        }
+        const loaded = await this._loadCommunitySource(normalizedUrl, sourceId);
+        if (existing) {
+            assertImmutableSourceVersions(existing.entries, loaded.entries);
+        }
+        const sourceRecord = {
+            id: sourceId,
+            name:
+                typeof name === 'string' && name.trim()
+                    ? name.trim().slice(0, 200)
+                    : existing?.name || normalizedUrl,
+            url: loaded.url,
+            status: 'ready',
+            verified: loaded.verified,
+            verificationMode: loaded.verificationMode,
+            digest: loaded.digest,
+            publisher: loaded.publisher ? clone(loaded.publisher) : null,
+            entries: clone(loaded.entries),
+            sequence: loaded.sequence,
+            generatedAt: loaded.generatedAt,
+            expiresAt: loaded.expiresAt,
+            headers: clone(loaded.headers),
+            addedAt: existing?.addedAt || now(),
+            updatedAt: now(),
+            lastError: null,
+            lastIdempotencyKey: idempotencyKey || null,
+        };
+        const committed = this._commit(
+            (state) => {
+                state.sources[sourceId] = sourceRecord;
+                this._recordAudit(state, {
+                    action: existing ? 'refresh-source' : 'add-source',
+                    sourceId,
+                    result: 'ready',
+                    entryCount: sourceRecord.entries.length,
+                });
+                return state;
+            },
+            { expectedRevision },
+        );
+        return publicExtensionSource(committed.sources[sourceId]);
+    }
+
+    async refreshSource(sourceId, { expectedRevision, idempotencyKey } = {}) {
+        if (!this.env.isNode) {
+            throw errorWithCode(
+                'EXTENSION_SOURCE_MANAGEMENT_UNSUPPORTED',
+                'Community extension sources are only available on the Node Host',
+            );
+        }
+        const existing = this._findSource(sourceId);
+        if (!existing) {
+            throw errorWithCode(
+                'EXTENSION_SOURCE_NOT_FOUND',
+                `Extension source ${sourceId} was not found`,
+            );
+        }
+        this._assertSourceRevision(expectedRevision);
+        if (existing.lastIdempotencyKey === idempotencyKey) {
+            return publicExtensionSource(existing);
+        }
+        try {
+            const loaded = await this._loadCommunitySource(
+                existing.url,
+                sourceId,
+            );
+            assertImmutableSourceVersions(existing.entries, loaded.entries);
+            const committed = this._commit(
+                (state) => {
+                    const source = state.sources[sourceId];
+                    if (!source) return state;
+                    Object.assign(source, {
+                        status: 'ready',
+                        verified: loaded.verified,
+                        verificationMode: loaded.verificationMode,
+                        digest: loaded.digest,
+                        publisher: loaded.publisher
+                            ? clone(loaded.publisher)
+                            : null,
+                        entries: clone(loaded.entries),
+                        sequence: loaded.sequence,
+                        generatedAt: loaded.generatedAt,
+                        expiresAt: loaded.expiresAt,
+                        headers: clone(loaded.headers),
+                        updatedAt: now(),
+                        lastError: null,
+                        lastIdempotencyKey: idempotencyKey || null,
+                    });
+                    this._recordAudit(state, {
+                        action: 'refresh-source',
+                        sourceId,
+                        result: 'ready',
+                        entryCount: source.entries.length,
+                    });
+                    return state;
+                },
+                { expectedRevision },
+            );
+            return publicExtensionSource(committed.sources[sourceId]);
+        } catch (error) {
+            try {
+                const failedState = this._commit(
+                    (state) => {
+                        const source = state.sources[sourceId];
+                        if (source) {
+                            source.status = 'error';
+                            source.lastError = {
+                                code:
+                                    error.code ||
+                                    'EXTENSION_SOURCE_REFRESH_FAILED',
+                                message: error.message,
+                            };
+                            source.updatedAt = now();
+                        }
+                        return state;
+                    },
+                    { expectedRevision },
+                );
+                error.source = publicExtensionSource(
+                    failedState.sources[sourceId],
+                );
+            } catch (stateError) {
+                error.stateError = stateError;
+            }
+            throw error;
+        }
+    }
+
+    removeSource(sourceId, { expectedRevision, idempotencyKey } = {}) {
+        const current = this.readState();
+        const source = current.sources?.[sourceId];
+        if (!source) {
+            throw errorWithCode(
+                'EXTENSION_SOURCE_NOT_FOUND',
+                `Extension source ${sourceId} was not found`,
+            );
+        }
+        this._assertSourceRevision(expectedRevision);
+        const committed = this._commit(
+            (state) => {
+                delete state.sources[sourceId];
+                this._recordAudit(state, {
+                    action: 'remove-source',
+                    sourceId,
+                    result: 'removed',
+                    idempotencyKey: idempotencyKey || null,
+                });
+                return state;
+            },
+            { expectedRevision },
+        );
+        return {
+            id: sourceId,
+            status: 'removed',
+            retainedInstallations: Object.values(committed.installed).filter(
+                (record) => record.sourceId === sourceId,
+            ).length,
         };
     }
 
@@ -1109,6 +2106,88 @@ export class ExtensionManager {
         };
     }
 
+    _assertTrustedOfficialReleaseKey(manifest, packageInput) {
+        const allowedKeyIds = this.trustedOfficialKeyIds[manifest.id] || [];
+        const keyId = packageInput?.signature?.keyId || null;
+        if (!allowedKeyIds.includes(keyId)) {
+            throw errorWithCode(
+                'EXTENSION_SIGNING_KEY_NOT_ALLOWED',
+                'Extension package signing key is not authorized for this extension',
+                {
+                    extensionId: manifest.id,
+                    keyId,
+                    allowedKeyIds: clone(allowedKeyIds),
+                },
+            );
+        }
+    }
+
+    _assertTrustedOfficialSourceManifest(
+        manifest,
+        { selectedVariant, packageDigest } = {},
+    ) {
+        const compatibility = this._preflightManifest(manifest, 'node');
+        const allowedKeyIds = this.trustedOfficialKeyIds[manifest.id] || [];
+        if (!allowedKeyIds.length) {
+            throw errorWithCode(
+                'EXTENSION_SIGNING_KEY_NOT_ALLOWED',
+                'Extension has no authorized remote release key',
+                { extensionId: manifest.id },
+            );
+        }
+        const officialEntry =
+            this.officialCatalog.find(
+                (candidate) =>
+                    (candidate.manifest || candidate).id === manifest.id,
+            ) || findCatalogEntry(manifest.id);
+        const officialManifest = officialEntry
+            ? normalizeExtensionManifest(
+                  officialEntry.manifest || officialEntry,
+              )
+            : null;
+        const comparison = officialManifest
+            ? compareVersions(manifest.version, officialManifest.version)
+            : null;
+        if (
+            !officialManifest ||
+            officialManifest.kind !== 'trusted-official' ||
+            comparison === null ||
+            comparison < 0
+        ) {
+            throw errorWithCode(
+                'EXTENSION_SOURCE_OFFICIAL_MIRROR_UNAUTHORIZED',
+                'Extension source cannot mirror an unauthorized official version',
+                {
+                    extensionId: manifest.id,
+                    version: manifest.version,
+                    officialVersion: officialManifest?.version || null,
+                },
+            );
+        }
+        if (comparison === 0) {
+            if (canonicalJson(officialManifest) !== canonicalJson(manifest)) {
+                throw errorWithCode(
+                    'EXTENSION_SOURCE_OFFICIAL_MIRROR_UNAUTHORIZED',
+                    'Extension source changed the official manifest without increasing its version',
+                    { extensionId: manifest.id, version: manifest.version },
+                );
+            }
+            this._assertCatalogReady(manifest);
+            if (selectedVariant && packageDigest) {
+                this._assertPackageCatalogAuthorization(
+                    manifest,
+                    selectedVariant,
+                    packageDigest,
+                );
+            }
+        }
+        return {
+            ...compatibility,
+            officialVersion: officialManifest.version,
+            versionComparison: comparison,
+        };
+    }
+
     _assertManifestCatalogAuthorization(manifest) {
         const normalized = normalizeExtensionManifest(manifest);
         const authorization = this.catalogAuthorizations.get(
@@ -1183,8 +2262,8 @@ export class ExtensionManager {
     }
 
     _hostFacade(extensionId) {
-        const adapter = this.adapters.get(extensionId);
         const invoke = (method) => {
+            const adapter = this.adapters.get(extensionId);
             if (!adapter || typeof adapter[method] !== 'function') {
                 throw errorWithCode(
                     'EXTENSION_IMPLEMENTATION_UNAVAILABLE',
@@ -1194,9 +2273,56 @@ export class ExtensionManager {
             }
             return adapter[method]();
         };
+        const manifest = this.getManifest(extensionId);
+        const services = this.hostBindings.createServices?.({
+            extensionId,
+            manifest,
+            manager: this,
+            store: this.store,
+        });
         return Object.freeze({
             apiVersion: EXTENSION_HOST_API_VERSION,
             extensionId,
+            services,
+            registerAdapter: (adapter) => {
+                if (adapter?.extensionId !== extensionId) {
+                    throw errorWithCode(
+                        'EXTENSION_ABI_MISMATCH',
+                        'Extension adapter identity does not match its package',
+                        {
+                            extensionId,
+                            adapterExtensionId: adapter?.extensionId,
+                        },
+                    );
+                }
+                return this.registerAdapter(extensionId, adapter);
+            },
+            unregisterAdapter: (adapter) =>
+                this.unregisterAdapter(extensionId, adapter),
+            registerContribution: (contribution) => {
+                if (contribution?.extensionId !== extensionId) {
+                    throw errorWithCode(
+                        'EXTENSION_ABI_MISMATCH',
+                        'Extension contribution identity does not match its package',
+                        {
+                            extensionId,
+                            contributionExtensionId:
+                                contribution?.extensionId || null,
+                        },
+                    );
+                }
+                if (
+                    typeof this.hostBindings.registerContribution !== 'function'
+                ) {
+                    throw errorWithCode(
+                        'EXTENSION_CONTRIBUTION_HOST_UNAVAILABLE',
+                        'The Host cannot register extension contributions',
+                    );
+                }
+                return this.hostBindings.registerContribution(contribution);
+            },
+            unregisterContribution: () =>
+                this.hostBindings.unregisterContribution?.(extensionId),
             activate: () => invoke('activate'),
             deactivate: () => invoke('deactivate'),
         });
@@ -1235,35 +2361,66 @@ export class ExtensionManager {
                     { extensionId: record.extensionId },
                 );
             }
+            this.activeRuntimeModules.set(record.extensionId, runtimeModule);
             this.packageStore.commitActive(record);
+            this.runtimeGateBlocks.delete(record.extensionId);
             return result;
         }
         if (
             record.source === 'bundled' &&
             !this.adapters.has(record.extensionId)
         ) {
+            this.runtimeGateBlocks.delete(record.extensionId);
             return { active: true, bundled: true };
         }
-        return facade.activate();
+        const result = facade.activate();
+        this.runtimeGateBlocks.delete(record.extensionId);
+        return result;
     }
 
     _deactivateRecord(record) {
         const facade = this._hostFacade(record.extensionId);
+        const errors = [];
+        this.runtimeGateBlocks.set(record.extensionId, {
+            reasonCode: 'EXTENSION_DISABLED',
+            blockedAt: now(),
+        });
         if (this.packageStore && record.entrypoint) {
             try {
-                this.packageStore.load(record)?.deactivate?.(facade);
+                const runtimeModule = this.activeRuntimeModules.get(
+                    record.extensionId,
+                );
+                if (typeof runtimeModule?.deactivate === 'function') {
+                    runtimeModule.deactivate(facade);
+                } else {
+                    // The Host adapter is trusted and already resident. It is
+                    // safer to close it directly than to reload package bytes.
+                    facade.deactivate();
+                }
+            } catch (error) {
+                errors.push(error);
             } finally {
-                this.packageStore.deactivate(record.extensionId, record);
+                this.activeRuntimeModules.delete(record.extensionId);
+                try {
+                    this.packageStore.deactivate(record.extensionId, record);
+                } catch (error) {
+                    errors.push(error);
+                }
             }
-            return;
+            return { active: false, errors };
         }
         if (
             record.source === 'bundled' &&
             !this.adapters.has(record.extensionId)
         ) {
-            return;
+            return { active: false, errors };
         }
-        facade.deactivate();
+        try {
+            facade.deactivate();
+        } catch (error) {
+            errors.push(error);
+        }
+        return { active: false, errors };
     }
 
     restoreEnabledExtension(extensionId) {
@@ -1325,6 +2482,113 @@ export class ExtensionManager {
                     record?.compatibilityStatus === 'compatible',
             )
             .map((record) => this.restoreEnabledExtension(record.extensionId));
+    }
+
+    adoptLegacyConfigGeneratorIfNeeded() {
+        const extensionId = EXTENSION_IDS.configGenerator;
+        if (!this.env.isNode || !this.packageStore) return null;
+        const state = this.readState();
+        const currentRecord = state.installed[extensionId];
+        const hasBundledRecord = currentRecord?.source === 'bundled';
+        const previousMigration =
+            state.migrations[LEGACY_CONFIG_GENERATOR_ADOPTION];
+        if (currentRecord && !hasBundledRecord) {
+            if (
+                currentRecord.source === 'legacy-adoption' &&
+                currentRecord.adoptionStatus === 'reinstall-required' &&
+                previousMigration
+            ) {
+                return {
+                    extensionId,
+                    status: previousMigration.status,
+                    reasonCode: previousMigration.reasonCode,
+                    previouslyAttempted: true,
+                };
+            }
+            return null;
+        }
+        if (previousMigration) {
+            return {
+                extensionId,
+                status: previousMigration.status,
+                reasonCode: previousMigration.reasonCode,
+                previouslyAttempted: true,
+            };
+        }
+        let legacyValue;
+        try {
+            legacyValue = this.store.read(CONFIG_GENERATOR_KEY);
+        } catch (error) {
+            return {
+                extensionId,
+                status: 'failed-closed',
+                reasonCode: 'EXTENSION_LEGACY_ADOPTION_READ_FAILED',
+            };
+        }
+        if (!hasBundledRecord && legacyValue === undefined) return null;
+        const adoption = {
+            kind: hasBundledRecord
+                ? 'legacy-bundled-config-generator'
+                : 'legacy-config-generator-storage',
+            key: CONFIG_GENERATOR_KEY,
+            detectedAt: now(),
+        };
+        const manifest = this.getManifest(extensionId);
+        const authorization = manifest
+            ? this._assertManifestCatalogAuthorization(manifest)
+            : null;
+        const committed = this._commit((nextState) => {
+            nextState.installed[extensionId] = {
+                extensionId,
+                version: manifest?.version || null,
+                kind: manifest?.kind || 'trusted-official',
+                manifestDigest: authorization?.manifestDigest || null,
+                packageDigest: null,
+                receiptDigest: null,
+                selectedVariant: 'node',
+                implementation: {},
+                verificationMode: this.catalogVerificationMode,
+                compatibility: manifest
+                    ? this._preflightManifest(manifest, 'node')
+                    : null,
+                manifestSnapshot: manifest ? clone(manifest) : null,
+                distribution: 'trusted-official-package',
+                installationStatus: 'removed',
+                dataStatus: 'retained',
+                retainedReason: 'legacy-data',
+                enabled: false,
+                codeStatus: 'missing',
+                compatibilityStatus: 'compatible',
+                adoption: clone(adoption),
+                adoptionStatus: 'reinstall-required',
+                reinstallHint: {
+                    sourceRequired: true,
+                    localDirectorySupported: true,
+                },
+                installedAt: 0,
+                updatedAt: now(),
+                source: 'legacy-adoption',
+            };
+            nextState.migrations[LEGACY_CONFIG_GENERATOR_ADOPTION] = {
+                status: 'reinstall-required',
+                extensionId,
+                reasonCode: 'EXTENSION_SOURCE_PACKAGE_REQUIRED',
+                detectedAt: adoption.detectedAt,
+            };
+            this._recordAudit(nextState, {
+                action: 'legacy-adoption',
+                extensionId,
+                result: 'retained-data-reinstall-required',
+                reasonCode: 'EXTENSION_SOURCE_PACKAGE_REQUIRED',
+            });
+            return nextState;
+        });
+        return {
+            extensionId,
+            status: 'reinstall-required',
+            reasonCode: 'EXTENSION_SOURCE_PACKAGE_REQUIRED',
+            record: publicRecord(committed.installed[extensionId]),
+        };
     }
 
     adoptLegacyConfigHostingIfNeeded() {
@@ -1487,15 +2751,217 @@ export class ExtensionManager {
         }
     }
 
-    _verifyLocalPackage(extensionId, input = {}) {
-        const manifest = this.getManifest(extensionId);
-        if (!manifest) {
+    _communityPackageInput(entry, document, runtime) {
+        const manifest = normalizeExtensionManifest(entry.manifest || entry);
+        if (manifest.kind !== 'content') {
             throw errorWithCode(
-                'EXTENSION_UNKNOWN',
-                `Unknown extension ${extensionId}`,
+                'EXTENSION_COMMUNITY_EXECUTION_FORBIDDEN',
+                'Only content extensions can be installed from community sources',
+                { extensionId: manifest.id },
             );
         }
-        this._assertCatalogReady(manifest);
+        const compatibility = this._preflightManifest(manifest, runtime);
+        const selectedVariant =
+            document?.selectedVariant ||
+            document?.payload?.selectedVariant ||
+            compatibility.selectedVariant ||
+            entry.selectedVariant;
+        const variant = manifest.variants?.[selectedVariant];
+        if (!selectedVariant || !variant) {
+            throw errorWithCode(
+                'EXTENSION_VARIANT_MISMATCH',
+                `No community package variant is available for ${runtime}`,
+                { extensionId: manifest.id, runtime, selectedVariant },
+            );
+        }
+        if (variant.containsExecutableCode !== false) {
+            throw errorWithCode(
+                'EXTENSION_COMMUNITY_EXECUTION_FORBIDDEN',
+                'Community extension variants must explicitly disable executable code',
+                { extensionId: manifest.id, selectedVariant },
+            );
+        }
+        const rawPayload = document?.payload || document;
+        if (!rawPayload || typeof rawPayload !== 'object') {
+            throw errorWithCode(
+                'EXTENSION_PACKAGE_INVALID',
+                'Community extension package payload is invalid',
+            );
+        }
+        if (
+            canonicalJson(rawPayload.manifest || null) !==
+            canonicalJson(manifest)
+        ) {
+            throw errorWithCode(
+                'EXTENSION_PACKAGE_MANIFEST_MISMATCH',
+                'Community package manifest does not match its catalog entry',
+                { extensionId: manifest.id },
+            );
+        }
+        if (
+            rawPayload.schemaVersion !== 1 ||
+            rawPayload.selectedVariant !== selectedVariant ||
+            canonicalJson(rawPayload.variant || null) !== canonicalJson(variant)
+        ) {
+            throw errorWithCode(
+                'EXTENSION_VARIANT_PROJECTION_MISMATCH',
+                'Community package variant does not match its manifest',
+                { extensionId: manifest.id, selectedVariant },
+            );
+        }
+        if (
+            rawPayload.containsExecutableCode !== false ||
+            rawPayload.containsInstallHook !== false
+        ) {
+            throw errorWithCode(
+                'EXTENSION_COMMUNITY_EXECUTION_FORBIDDEN',
+                'Community package payloads must explicitly disable executable code and install hooks',
+                { extensionId: manifest.id, selectedVariant },
+            );
+        }
+        const files = rawPayload.files;
+        const fileDigests = rawPayload.fileDigests;
+        assertVerifiedPackageFiles(files, fileDigests);
+        const projection = {
+            schemaVersion: 1,
+            manifest,
+            selectedVariant,
+            variant,
+            containsExecutableCode: false,
+            containsInstallHook: false,
+            files: clone(files),
+            fileDigests: clone(fileDigests),
+        };
+        const packageDigest = extensionPackageDigest(projection);
+        const expectedCatalogDigest = sourceEntryPackageDigest(
+            entry,
+            selectedVariant,
+        );
+        if (
+            rawPayload.packageDigest &&
+            rawPayload.packageDigest !== packageDigest
+        ) {
+            throw errorWithCode(
+                'EXTENSION_PACKAGE_DIGEST_INVALID',
+                'Community package digest does not match its payload',
+                { packageDigest, declared: rawPayload.packageDigest },
+            );
+        }
+        if (expectedCatalogDigest && expectedCatalogDigest !== packageDigest) {
+            throw errorWithCode(
+                'EXTENSION_SOURCE_PACKAGE_MISMATCH',
+                'Community package does not match the catalog digest',
+                { expectedPackageDigest: expectedCatalogDigest, packageDigest },
+            );
+        }
+        const expectedImplementation = {
+            id: variant.implementationId,
+            abi: variant.implementationAbi,
+            frontendAssetId: variant.frontendAssetId,
+            entrypoint: undefined,
+            lanes:
+                embeddedExtensionImplementations[manifest.id]?.lanes ||
+                manifest.scriptExecutionLanes,
+            containsExecutableCode: false,
+        };
+        const suppliedReceipt = rawPayload.receipt || document?.receipt;
+        const receipt = suppliedReceipt
+            ? clone(suppliedReceipt)
+            : createDigestReceipt({
+                  manifest,
+                  packageDigest,
+                  variant: selectedVariant,
+                  implementation: expectedImplementation,
+              });
+        if (
+            receipt?.implementation?.entrypoint != null ||
+            receipt?.packageDigest !== packageDigest
+        ) {
+            throw errorWithCode(
+                'EXTENSION_RECEIPT_IMPLEMENTATION_MISMATCH',
+                'Community package receipt declares executable implementation metadata',
+                { extensionId: manifest.id },
+            );
+        }
+        const signedPayload = {
+            ...projection,
+            packageDigest,
+            receipt,
+        };
+        const payloadDigest = sha256Hex(canonicalJson(signedPayload));
+        if (!payloadDigest) {
+            throw errorWithCode(
+                'EXTENSION_CRYPTO_UNAVAILABLE',
+                'SHA-256 is required to install a community extension',
+            );
+        }
+        const signature = document?.signature || {
+            algorithm: 'sha256-digest',
+            keyId: `community-${entry.sourceId || 'source'}`,
+            digest: payloadDigest,
+            value: payloadDigest,
+        };
+        const packageInput = {
+            schemaVersion: 1,
+            source: 'community',
+            manifest: clone(manifest),
+            receipt,
+            packageDigest,
+            selectedVariant,
+            payload: signedPayload,
+            signature,
+        };
+        if (!isCommunityContentPackage(packageInput)) {
+            throw errorWithCode(
+                'EXTENSION_COMMUNITY_EXECUTION_FORBIDDEN',
+                'Community package failed the content-only execution contract',
+                { extensionId: manifest.id },
+            );
+        }
+        const envelopeResult = verifySignedEnvelope(
+            { payload: signedPayload, signature },
+            { ...this.verificationOptions, allowDigestOnly: true },
+        );
+        if (!envelopeResult.valid) {
+            throw errorWithCode(
+                envelopeResult.reasonCode ||
+                    'EXTENSION_PACKAGE_SIGNATURE_INVALID',
+                'Community package signature/digest verification failed',
+                envelopeResult,
+            );
+        }
+        const receiptResult = verifyReceipt(receipt, manifest, {
+            expectedVariant: selectedVariant,
+            expectedPackageDigest: packageDigest,
+            expectedImplementation,
+        });
+        if (!receiptResult.valid) {
+            throw errorWithCode(
+                receiptResult.reasonCode || 'EXTENSION_RECEIPT_INVALID',
+                'Community package receipt verification failed',
+                receiptResult,
+            );
+        }
+        return {
+            manifest,
+            packageInput,
+            receipt,
+            variant,
+            compatibility,
+            expectedImplementation,
+            verification: envelopeResult,
+            verificationMode: 'community-integrity',
+        };
+    }
+
+    _verifyCommunityPackage(extensionId, input = {}) {
+        const entry = input.catalogEntry || this.findEntry(extensionId);
+        if (!entry || entry.distribution !== 'community') {
+            throw errorWithCode(
+                'EXTENSION_SOURCE_NOT_FOUND',
+                `Community extension ${extensionId} is not present in a source`,
+            );
+        }
         const runtime = input.runtime || this.runtime;
         if (input.runtime && input.runtime !== this.runtime) {
             throw errorWithCode(
@@ -1503,14 +2969,113 @@ export class ExtensionManager {
                 `Package runtime ${input.runtime} does not match ${this.runtime}`,
             );
         }
-        const compatibility = this._preflightManifest(manifest, runtime);
+        const verified = this._communityPackageInput(
+            entry,
+            input.package,
+            runtime,
+        );
+        if (input.version && input.version !== verified.manifest.version) {
+            throw errorWithCode(
+                'EXTENSION_VERSION_UNAVAILABLE',
+                `Requested extension version ${input.version} is unavailable`,
+                {
+                    requestedVersion: input.version,
+                    availableVersion: verified.manifest.version,
+                },
+            );
+        }
+        return verified;
+    }
+
+    async installFromSource(extensionId, input = {}) {
+        const canonicalId = this.resolveId(extensionId);
+        const entry = input.catalogEntry || this.findEntry(canonicalId);
+        const communityPackage = entry?.distribution === 'community';
+        const trustedOfficialMirror =
+            entry?.remotePackage === true ||
+            entry?.distribution === TRUSTED_OFFICIAL_MIRROR_DISTRIBUTION;
+        if (!entry || (!communityPackage && !trustedOfficialMirror)) {
+            return this.install(canonicalId, input);
+        }
+        const source = entry.sourceId ? this._findSource(entry.sourceId) : null;
+        if (
+            entry.sourceMissing === true ||
+            (entry.sourceId && (!source || source.verified !== true))
+        ) {
+            throw errorWithCode(
+                'EXTENSION_SOURCE_NOT_FOUND',
+                `Extension ${canonicalId} no longer has an installed source`,
+                { extensionId: canonicalId, sourceId: entry.sourceId || null },
+            );
+        }
+        const runtime = input.runtime || this.runtime;
+        const selectedVariant =
+            entry.selectedVariant ||
+            this._preflightManifest(entry.manifest || entry, runtime)
+                .selectedVariant;
+        const packageUrl = sourceEntryPackageUrl(entry, selectedVariant);
+        if (!packageUrl) {
+            throw errorWithCode(
+                'EXTENSION_SOURCE_PACKAGE_URL_MISSING',
+                `Extension ${canonicalId} has no source package URL`,
+            );
+        }
+        const packageDocument = entry.inlinePackage
+            ? clone(entry.inlinePackage)
+            : (
+                  await fetchExtensionSourceDocument(packageUrl, {
+                      fetcher: this.sourceFetcher,
+                  })
+              ).document;
+        return this.install(canonicalId, {
+            ...input,
+            runtime,
+            source: communityPackage ? 'community' : 'trusted-official-mirror',
+            package: packageDocument,
+            catalogEntry: entry,
+        });
+    }
+
+    _verifyLocalPackage(extensionId, input = {}) {
+        const catalogEntry = input.catalogEntry || this.findEntry(extensionId);
+        const manifest = catalogEntry
+            ? normalizeExtensionManifest(catalogEntry.manifest || catalogEntry)
+            : this.getManifest(extensionId);
+        if (!manifest) {
+            throw errorWithCode(
+                'EXTENSION_UNKNOWN',
+                `Unknown extension ${extensionId}`,
+            );
+        }
+        const runtime = input.runtime || this.runtime;
+        if (input.runtime && input.runtime !== this.runtime) {
+            throw errorWithCode(
+                'EXTENSION_RUNTIME_MISMATCH',
+                `Package runtime ${input.runtime} does not match ${this.runtime}`,
+            );
+        }
+        const trustedOfficialMirror =
+            input.source === 'trusted-official-mirror' &&
+            catalogEntry?.distribution === TRUSTED_OFFICIAL_MIRROR_DISTRIBUTION;
+        let compatibility;
+        if (trustedOfficialMirror) {
+            compatibility = this._assertTrustedOfficialSourceManifest(manifest);
+        } else {
+            this._assertCatalogReady(manifest);
+            compatibility = this._preflightManifest(manifest, runtime);
+        }
         const expectedVariant = compatibility.selectedVariant;
         const packageInput =
             input.package || createLocalOfficialPackage(manifest.id, runtime);
         if (!packageInput) {
             throw errorWithCode(
-                'EXTENSION_PACKAGE_NOT_FOUND',
-                `No local official package is available for ${manifest.id}`,
+                'EXTENSION_SOURCE_PACKAGE_REQUIRED',
+                `Install ${manifest.id} from a verified extension source or signed local directory`,
+                {
+                    extensionId: manifest.id,
+                    runtime,
+                    localDirectorySupported: runtime === 'node',
+                },
             );
         }
         if (
@@ -1620,57 +3185,39 @@ export class ExtensionManager {
                 },
             );
         }
-        this._assertPackageCatalogAuthorization(
-            manifest,
-            expectedVariant,
-            packageInput.packageDigest,
-        );
-        const files = payload.files;
-        const fileDigests = payload.fileDigests;
+        const declaredSourceDigest = trustedOfficialMirror
+            ? sourceEntryPackageDigest(catalogEntry, expectedVariant)
+            : null;
         if (
-            !files ||
-            typeof files !== 'object' ||
-            Array.isArray(files) ||
-            !fileDigests ||
-            typeof fileDigests !== 'object' ||
-            Array.isArray(fileDigests) ||
-            Object.keys(files).length > MAX_PACKAGE_FILES ||
-            canonicalJson(Object.keys(files).sort()) !==
-                canonicalJson(Object.keys(fileDigests).sort())
+            trustedOfficialMirror &&
+            declaredSourceDigest !== packageInput.packageDigest
         ) {
             throw errorWithCode(
-                'EXTENSION_PACKAGE_FILE_DIGEST_MISMATCH',
-                'Package files and file digest map do not match',
+                'EXTENSION_SOURCE_PACKAGE_DIGEST_MISMATCH',
+                'Downloaded extension package does not match the source digest',
+                {
+                    extensionId: manifest.id,
+                    version: manifest.version,
+                    expectedPackageDigest: declaredSourceDigest,
+                    actualPackageDigest: packageInput.packageDigest,
+                },
             );
         }
-        let totalPackageBytes = 0;
-        for (const [relativeName, content] of Object.entries(files)) {
-            const normalizedName = relativeName.replace(/\\/g, '/');
-            const rootName = normalizedName.split('/')[0];
-            const byteLength =
-                typeof content === 'string'
-                    ? typeof TextEncoder === 'function'
-                        ? new TextEncoder().encode(content).byteLength
-                        : content.length
-                    : Number.POSITIVE_INFINITY;
-            totalPackageBytes += byteLength;
-            if (
-                !packageFileIsSafe(relativeName) ||
-                (normalizedName === rootName &&
-                    RESERVED_PACKAGE_FILES.has(rootName.toLowerCase())) ||
-                typeof content !== 'string' ||
-                byteLength > MAX_PACKAGE_FILE_BYTES ||
-                totalPackageBytes > MAX_PACKAGE_BYTES ||
-                !isSha256Digest(fileDigests[relativeName]) ||
-                sha256Hex(content) !== fileDigests[relativeName]
-            ) {
-                throw errorWithCode(
-                    'EXTENSION_PACKAGE_FILE_DIGEST_MISMATCH',
-                    `Package file failed verification: ${relativeName}`,
-                    { file: relativeName },
-                );
-            }
+        if (trustedOfficialMirror) {
+            this._assertTrustedOfficialSourceManifest(manifest, {
+                selectedVariant: expectedVariant,
+                packageDigest: packageInput.packageDigest,
+            });
+        } else {
+            this._assertPackageCatalogAuthorization(
+                manifest,
+                expectedVariant,
+                packageInput.packageDigest,
+            );
         }
+        const files = payload.files;
+        const fileDigests = payload.fileDigests;
+        assertVerifiedPackageFiles(files, fileDigests);
         const containsExecutableCode =
             expectedImplementation.containsExecutableCode;
         if (
@@ -1721,6 +3268,9 @@ export class ExtensionManager {
                 envelopeResult,
             );
         }
+        if (trustedOfficialMirror) {
+            this._assertTrustedOfficialReleaseKey(manifest, packageInput);
+        }
         const receiptResult = verifyReceipt(packageInput.receipt, manifest, {
             expectedVariant,
             expectedPackageDigest: packageInput.packageDigest,
@@ -1754,9 +3304,38 @@ export class ExtensionManager {
         };
     }
 
+    inspectLocalPackage(packageInput) {
+        if (this.runtime !== 'node') {
+            const error = errorWithCode(
+                'EXTENSION_LOCAL_PACKAGE_UNSUPPORTED',
+                'Local extension package inspection is only available on Node',
+                { runtime: this.runtime },
+            );
+            error.statusCode = 501;
+            throw error;
+        }
+        const extensionId = packageInput?.manifest?.id;
+        const verified = this._verifyLocalPackage(extensionId, {
+            runtime: 'node',
+            package: packageInput,
+        });
+        this.packageStore?.validatePackageInput?.(verified.packageInput);
+        return {
+            extensionId: verified.manifest.id,
+            manifest: clone(verified.manifest),
+            receipt: clone(verified.receipt),
+            selectedVariant: verified.receipt.selectedVariant,
+            packageDigest: verified.receipt.packageDigest,
+            verificationMode: verified.verificationMode,
+            compatibility: clone(verified.compatibility),
+        };
+    }
+
     install(extensionId, input = {}) {
         const canonicalId = this.resolveId(extensionId);
-        this._assertCatalogReady();
+        const catalogEntry = input.catalogEntry || this.findEntry(canonicalId);
+        const isCommunity = catalogEntry?.distribution === 'community';
+        const taskAction = input.taskAction || 'install';
         const currentState = this.readState();
         const currentRevision = currentState.revision;
         if (
@@ -1775,7 +3354,7 @@ export class ExtensionManager {
         const existingTask = this._findIdempotentTask(
             currentState,
             canonicalId,
-            'install',
+            taskAction,
             input.idempotencyKey,
         );
         if (existingTask) {
@@ -1784,11 +3363,98 @@ export class ExtensionManager {
                 currentState.installed[canonicalId],
             );
         }
-        const verified = this._verifyLocalPackage(canonicalId, input);
-        const stagedPackage = this.packageStore
-            ? this.packageStore.stage(verified.packageInput)
-            : null;
+        if (isCommunity && !input.package) {
+            throw errorWithCode(
+                'EXTENSION_SOURCE_PACKAGE_REQUIRED',
+                'Community extensions must be installed through their verified source package URL',
+            );
+        }
+        const verified = isCommunity
+            ? this._verifyCommunityPackage(canonicalId, input)
+            : this._verifyLocalPackage(canonicalId, input);
         const previous = currentState.installed[canonicalId];
+        if (previous?.installationStatus === 'installed') {
+            const versionComparison = compareVersions(
+                verified.manifest.version,
+                previous.version,
+            );
+            if (versionComparison === null) {
+                throw errorWithCode(
+                    'EXTENSION_VERSION_INVALID',
+                    'Extension package version cannot be compared with the installed version',
+                    {
+                        installedVersion: previous.version,
+                        packageVersion: verified.manifest.version,
+                    },
+                );
+            }
+            if (versionComparison < 0) {
+                throw errorWithCode(
+                    'EXTENSION_VERSION_DOWNGRADE_FORBIDDEN',
+                    'Use the rollback operation to restore an older extension version',
+                    {
+                        installedVersion: previous.version,
+                        packageVersion: verified.manifest.version,
+                    },
+                );
+            }
+            if (versionComparison === 0) {
+                if (previous.packageDigest !== verified.receipt.packageDigest) {
+                    throw errorWithCode(
+                        'EXTENSION_VERSION_IMMUTABLE',
+                        'An installed extension version cannot be replaced with different package content',
+                        {
+                            extensionId: canonicalId,
+                            version: previous.version,
+                            installedPackageDigest: previous.packageDigest,
+                            requestedPackageDigest:
+                                verified.receipt.packageDigest,
+                        },
+                    );
+                }
+                let noOpResult;
+                this._commit(
+                    (state) => {
+                        const record = state.installed[canonicalId];
+                        const task = this._createTask(state, {
+                            extensionId: canonicalId,
+                            action: taskAction,
+                            idempotencyKey: input.idempotencyKey,
+                        });
+                        const status =
+                            taskAction === 'update'
+                                ? 'current'
+                                : 'already-installed';
+                        this._finishTask(state, task, {
+                            extensionId: canonicalId,
+                            status,
+                            noOp: true,
+                        });
+                        this._recordAudit(state, {
+                            action: taskAction,
+                            extensionId: canonicalId,
+                            result: `${status}-no-op`,
+                        });
+                        noOpResult = {
+                            taskId: task.id,
+                            status,
+                            noOp: true,
+                            record: publicRecord(record),
+                        };
+                        return state;
+                    },
+                    { expectedRevision: input.expectedRevision },
+                );
+                const completedTask = this.getTask(noOpResult.taskId);
+                if (completedTask) noOpResult.task = clone(completedTask);
+                return noOpResult;
+            }
+        }
+        const stagedPackage = this.packageStore
+            ? this.packageStore.stage(verified.packageInput, {
+                  allowCommunityContent: isCommunity,
+              })
+            : null;
         const shouldReactivatePrevious = previous?.enabled === true;
         if (shouldReactivatePrevious) this._deactivateRecord(previous);
         let result;
@@ -1797,7 +3463,7 @@ export class ExtensionManager {
                 (state) => {
                     const task = this._createTask(state, {
                         extensionId: canonicalId,
-                        action: 'install',
+                        action: taskAction,
                         idempotencyKey: input.idempotencyKey,
                     });
                     if (task.status === 'succeeded') {
@@ -1826,8 +3492,22 @@ export class ExtensionManager {
                         ),
                         verificationMode: verified.verificationMode,
                         compatibility: clone(verified.compatibility),
-                        adoption: clone(input.adoption),
-                        adoptionStatus: input.adoption ? 'pending' : undefined,
+                        manifestSnapshot: clone(verified.manifest),
+                        distribution: catalogEntry?.distribution || 'store',
+                        sourceId: catalogEntry?.sourceId || null,
+                        sourceUrl: catalogEntry?.source || null,
+                        sourceName: catalogEntry?.sourceName || null,
+                        packageUrls: clone(catalogEntry?.packageUrls || {}),
+                        packageDigests: clone(
+                            catalogEntry?.packageDigests || {},
+                        ),
+                        adoption: clone(
+                            input.adoption || previousRecord?.adoption,
+                        ),
+                        adoptionStatus:
+                            input.adoption || previousRecord?.adoption
+                                ? 'completed'
+                                : undefined,
                         packageDirectory: stagedPackage?.directory || null,
                         entrypoint: stagedPackage?.entrypoint || null,
                         installationStatus: 'installed',
@@ -1840,26 +3520,49 @@ export class ExtensionManager {
                         compatibilityStatus: 'compatible',
                         installedAt: previousRecord?.installedAt || now(),
                         updatedAt: now(),
-                        source: input.source || 'official-local',
+                        source:
+                            input.source ||
+                            (isCommunity ? 'community' : 'official-local'),
+                        rollbackHistory:
+                            previousRecord?.installationStatus === 'installed'
+                                ? appendRollbackSnapshot(
+                                      previousRecord.rollbackHistory,
+                                      previousRecord,
+                                  )
+                                : [],
                     };
                     state.installed[canonicalId] = record;
+                    if (
+                        canonicalId === EXTENSION_IDS.configGenerator &&
+                        previousRecord?.adoption
+                    ) {
+                        state.migrations[LEGACY_CONFIG_GENERATOR_ADOPTION] = {
+                            status: 'completed',
+                            extensionId: canonicalId,
+                            completedAt: now(),
+                        };
+                    }
                     state.dataGeneration += 1;
+                    const resultStatus =
+                        taskAction === 'update'
+                            ? 'updated-disabled'
+                            : 'installed-disabled';
                     this._finishTask(state, task, {
                         extensionId: canonicalId,
-                        status: 'installed-disabled',
+                        status: resultStatus,
                         selectedVariant: record.selectedVariant,
                         packageDigest: record.packageDigest,
                     });
                     this._recordAudit(state, {
-                        action: 'install',
+                        action: taskAction,
                         extensionId: canonicalId,
                         packageDigest: record.packageDigest,
                         manifestDigest: record.manifestDigest,
-                        result: 'installed-disabled',
+                        result: resultStatus,
                     });
                     result = {
                         taskId: task.id,
-                        status: 'installed-disabled',
+                        status: resultStatus,
                         record: publicRecord(record),
                     };
                     return state;
@@ -1904,6 +3607,13 @@ export class ExtensionManager {
                 `Extension ${canonicalId} is not installed`,
             );
         }
+        if (enabled && before.distribution === 'community') {
+            throw errorWithCode(
+                'EXTENSION_CONTENT_ONLY',
+                'Community content extensions cannot be enabled as backend runtimes',
+                { extensionId: canonicalId },
+            );
+        }
         if (enabled && before.compatibilityStatus !== 'compatible') {
             throw errorWithCode(
                 before.reasonCode || 'EXTENSION_INCOMPATIBLE',
@@ -1918,7 +3628,10 @@ export class ExtensionManager {
             input.idempotencyKey,
         );
         if (existingTask) return this._taskResult(existingTask, before);
-        if (before.enabled === enabled) {
+        if (
+            before.enabled === enabled &&
+            !(enabled && this.runtimeGateBlocks.has(canonicalId))
+        ) {
             let noOpResult;
             this._commit(
                 (state) => {
@@ -2128,6 +3841,7 @@ export class ExtensionManager {
                         : this.env.isNode
                         ? 'removed'
                         : 'embedded-inactive';
+                    if (!requiresCodeCleanup) record.rollbackHistory = [];
                     delete record.cleanupError;
                     record.updatedAt = now();
                     if (!requiresCodeCleanup) {
@@ -2251,6 +3965,7 @@ export class ExtensionManager {
                 delete record.payloadDigest;
                 delete record.fileDigests;
                 delete record.cleanupError;
+                record.rollbackHistory = [];
                 record.updatedAt = now();
                 this._finishTask(state, task, {
                     extensionId: canonicalId,
@@ -2273,24 +3988,459 @@ export class ExtensionManager {
         );
     }
 
-    update(extensionId) {
-        const error = errorWithCode(
-            'EXTENSION_UPDATE_UNSUPPORTED',
-            'Extension update is not implemented by this Host version',
-            { extensionId: this.resolveId(extensionId) },
+    async update(extensionId, input = {}) {
+        const canonicalId = this.resolveId(extensionId);
+        const initialState = this.readState();
+        if (
+            input.expectedRevision !== undefined &&
+            Number(input.expectedRevision) !== Number(initialState.revision)
+        ) {
+            throw errorWithCode(
+                'EXTENSION_CONSISTENCY_CONFLICT',
+                'Extension state changed; reload before retrying',
+                {
+                    expectedRevision: Number(input.expectedRevision),
+                    currentRevision: initialState.revision,
+                },
+            );
+        }
+        const before = initialState.installed[canonicalId];
+        if (!before || before.installationStatus !== 'installed') {
+            throw errorWithCode(
+                'EXTENSION_NOT_INSTALLED',
+                `Extension ${canonicalId} is not installed`,
+            );
+        }
+        const existingTask = this._findIdempotentTask(
+            initialState,
+            canonicalId,
+            'update',
+            input.idempotencyKey,
         );
-        error.statusCode = 501;
-        throw error;
+        if (existingTask) return this._taskResult(existingTask, before);
+
+        const sourceId =
+            before.sourceId ||
+            Object.values(initialState.sources || {}).find((source) =>
+                (source.entries || []).some(
+                    (entry) => entry.id === canonicalId,
+                ),
+            )?.id;
+        if (!sourceId) {
+            throw errorWithCode(
+                'EXTENSION_UPDATE_SOURCE_REQUIRED',
+                'Extension updates require an installed extension source',
+                { extensionId: canonicalId },
+            );
+        }
+        await this.refreshSource(sourceId, {
+            expectedRevision: input.expectedRevision,
+            idempotencyKey: input.idempotencyKey
+                ? `update-refresh:${canonicalId}:${input.idempotencyKey}`
+                : undefined,
+        });
+        const refreshedState = this.readState();
+        const source = refreshedState.sources?.[sourceId];
+        const catalogEntry = (source?.entries || [])
+            .filter((entry) => entry.id === canonicalId)
+            .reduce(preferCatalogEntry, null);
+        if (!catalogEntry || source?.verified !== true) {
+            throw errorWithCode(
+                'EXTENSION_SOURCE_NOT_FOUND',
+                `Extension ${canonicalId} is no longer available from its source`,
+                { extensionId: canonicalId, sourceId },
+            );
+        }
+        const availableManifest = normalizeExtensionManifest(
+            catalogEntry.manifest || catalogEntry,
+        );
+        if (input.version && input.version !== availableManifest.version) {
+            throw errorWithCode(
+                'EXTENSION_VERSION_UNAVAILABLE',
+                `Requested extension version ${input.version} is unavailable`,
+                {
+                    requestedVersion: input.version,
+                    availableVersion: availableManifest.version,
+                },
+            );
+        }
+        const comparison = compareVersions(
+            availableManifest.version,
+            before.version,
+        );
+        if (comparison === null) {
+            throw errorWithCode(
+                'EXTENSION_VERSION_INVALID',
+                'Extension source version cannot be compared with the installed version',
+                {
+                    installedVersion: before.version,
+                    availableVersion: availableManifest.version,
+                },
+            );
+        }
+        if (comparison <= 0) {
+            let noOpResult;
+            this._commit(
+                (state) => {
+                    const record = state.installed[canonicalId];
+                    const task = this._createTask(state, {
+                        extensionId: canonicalId,
+                        action: 'update',
+                        idempotencyKey: input.idempotencyKey,
+                    });
+                    this._finishTask(state, task, {
+                        extensionId: canonicalId,
+                        status: 'current',
+                        noOp: true,
+                        installedVersion: before.version,
+                        availableVersion: availableManifest.version,
+                    });
+                    this._recordAudit(state, {
+                        action: 'update',
+                        extensionId: canonicalId,
+                        result: 'current-no-op',
+                    });
+                    noOpResult = {
+                        taskId: task.id,
+                        status: 'current',
+                        noOp: true,
+                        record: publicRecord(record),
+                    };
+                    return state;
+                },
+                { expectedRevision: refreshedState.revision },
+            );
+            const completedTask = this.getTask(noOpResult.taskId);
+            if (completedTask) noOpResult.task = clone(completedTask);
+            return noOpResult;
+        }
+
+        const installed = await this.installFromSource(canonicalId, {
+            ...input,
+            expectedRevision: refreshedState.revision,
+            taskAction: 'update',
+            catalogEntry,
+        });
+        if (installed.noOp) return installed;
+        const updatedRecord = this.getRecord(canonicalId);
+        if (before.enabled !== true) {
+            const cleanupWarning = cleanupObsoleteVersionPackages(
+                this.packageStore,
+                before,
+                updatedRecord,
+            );
+            if (cleanupWarning) installed.cleanupWarning = cleanupWarning;
+            return installed;
+        }
+
+        let activated = false;
+        try {
+            this._activateRecord(updatedRecord);
+            activated = true;
+            let result;
+            const committed = this._commit(
+                (state) => {
+                    const record = state.installed[canonicalId];
+                    if (
+                        !record ||
+                        record.packageDigest !== updatedRecord.packageDigest
+                    ) {
+                        throw errorWithCode(
+                            'EXTENSION_CONSISTENCY_CONFLICT',
+                            'Updated extension state changed before activation completed',
+                            { extensionId: canonicalId },
+                        );
+                    }
+                    const task = state.tasks.find(
+                        (candidate) => candidate.id === installed.taskId,
+                    );
+                    record.enabled = true;
+                    record.codeStatus = this.env.isNode
+                        ? 'verified-package-active'
+                        : 'embedded-active';
+                    record.updatedAt = now();
+                    if (task) {
+                        this._finishTask(state, task, {
+                            extensionId: canonicalId,
+                            status: 'updated-enabled',
+                            fromVersion: before.version,
+                            version: record.version,
+                            packageDigest: record.packageDigest,
+                        });
+                    }
+                    this._recordAudit(state, {
+                        action: 'update',
+                        extensionId: canonicalId,
+                        result: 'updated-enabled',
+                        fromVersion: before.version,
+                        version: record.version,
+                    });
+                    result = {
+                        taskId: installed.taskId,
+                        status: 'updated-enabled',
+                        record: publicRecord(record),
+                    };
+                    return state;
+                },
+                { expectedRevision: this.readState().revision },
+            );
+            const task = committed.tasks.find(
+                (candidate) => candidate.id === installed.taskId,
+            );
+            if (task) result.task = clone(task);
+            const cleanupWarning = cleanupObsoleteVersionPackages(
+                this.packageStore,
+                before,
+                this.getRecord(canonicalId),
+            );
+            if (cleanupWarning) result.cleanupWarning = cleanupWarning;
+            return result;
+        } catch (error) {
+            if (activated || updatedRecord) {
+                try {
+                    this._deactivateRecord(updatedRecord);
+                } catch (deactivationError) {
+                    error.deactivationError = deactivationError;
+                }
+            }
+            let restored = false;
+            try {
+                if (this.packageStore && before.entrypoint) {
+                    const verified =
+                        this.packageStore.verifyInstalledRecord(before);
+                    if (before.kind === 'trusted-official') {
+                        this._assertTrustedOfficialReleaseKey(
+                            before.manifestSnapshot,
+                            { signature: verified.packageMetadata.signature },
+                        );
+                    }
+                }
+                this._activateRecord(before);
+                restored = true;
+            } catch (rollbackError) {
+                error.rollbackError = rollbackError;
+            }
+            try {
+                this._commit((state) => {
+                    const task = state.tasks.find(
+                        (candidate) => candidate.id === installed.taskId,
+                    );
+                    const restoredRecord = clone(before);
+                    restoredRecord.enabled = restored;
+                    restoredRecord.codeStatus = restored
+                        ? this.env.isNode
+                            ? 'verified-package-active'
+                            : 'embedded-active'
+                        : this.env.isNode
+                        ? 'verified-package-inactive'
+                        : 'embedded-inactive';
+                    restoredRecord.updatedAt = now();
+                    state.installed[canonicalId] = restoredRecord;
+                    if (task) {
+                        this._finishTask(
+                            state,
+                            task,
+                            {
+                                extensionId: canonicalId,
+                                status: restored
+                                    ? 'update-failed-restored'
+                                    : 'update-failed-disabled',
+                                restoredVersion: before.version,
+                            },
+                            error,
+                        );
+                    }
+                    this._recordAudit(state, {
+                        action: 'update',
+                        extensionId: canonicalId,
+                        result: restored
+                            ? 'activation-failed-restored'
+                            : 'activation-failed-disabled',
+                        reasonCode: error.code || 'EXTENSION_ACTIVATION_FAILED',
+                    });
+                    return state;
+                });
+            } catch (stateError) {
+                error.stateError = stateError;
+            }
+            try {
+                this.packageStore?.removeVersion?.(updatedRecord);
+            } catch (cleanupError) {
+                error.cleanupError = cleanupError;
+            }
+            error.details = {
+                ...(error.details || {}),
+                extensionId: canonicalId,
+                attemptedVersion: updatedRecord?.version || null,
+                restoredVersion: restored ? before.version : null,
+                restored,
+            };
+            throw error;
+        }
     }
 
-    rollback(extensionId) {
-        const error = errorWithCode(
-            'EXTENSION_ROLLBACK_UNSUPPORTED',
-            'Extension rollback is not implemented by this Host version',
-            { extensionId: this.resolveId(extensionId) },
+    rollback(extensionId, input = {}) {
+        const canonicalId = this.resolveId(extensionId);
+        const currentState = this.readState();
+        if (
+            input.expectedRevision !== undefined &&
+            Number(input.expectedRevision) !== Number(currentState.revision)
+        ) {
+            throw errorWithCode(
+                'EXTENSION_CONSISTENCY_CONFLICT',
+                'Extension state changed; reload before retrying',
+                {
+                    expectedRevision: Number(input.expectedRevision),
+                    currentRevision: currentState.revision,
+                },
+            );
+        }
+        const before = currentState.installed[canonicalId];
+        if (!before || before.installationStatus !== 'installed') {
+            throw errorWithCode(
+                'EXTENSION_NOT_INSTALLED',
+                `Extension ${canonicalId} is not installed`,
+            );
+        }
+        const existingTask = this._findIdempotentTask(
+            currentState,
+            canonicalId,
+            'rollback',
+            input.idempotencyKey,
         );
-        error.statusCode = 501;
-        throw error;
+        if (existingTask) return this._taskResult(existingTask, before);
+        const history = verifiedRollbackHistory(before);
+        let targetIndex = history.length - 1;
+        if (input.version) {
+            targetIndex = -1;
+            for (let index = history.length - 1; index >= 0; index -= 1) {
+                if (history[index].version === input.version) {
+                    targetIndex = index;
+                    break;
+                }
+            }
+        }
+        if (targetIndex < 0) {
+            throw errorWithCode(
+                'EXTENSION_ROLLBACK_UNAVAILABLE',
+                'No verified rollback version is available',
+                {
+                    extensionId: canonicalId,
+                    requestedVersion: input.version || null,
+                    rollbackVersions: history.map(
+                        (snapshot) => snapshot.version,
+                    ),
+                },
+            );
+        }
+        const target = clone(history[targetIndex]);
+        this._preflightManifest(target.manifestSnapshot, this.runtime);
+        if (target.packageDirectory && !this.packageStore) {
+            throw errorWithCode(
+                'EXTENSION_ROLLBACK_PACKAGE_UNAVAILABLE',
+                'The verified rollback package store is unavailable',
+                { extensionId: canonicalId, version: target.version },
+            );
+        }
+        if (this.packageStore && target.entrypoint) {
+            const verified = this.packageStore.verifyInstalledRecord(target);
+            if (target.kind === 'trusted-official') {
+                this._assertTrustedOfficialReleaseKey(target.manifestSnapshot, {
+                    signature: verified.packageMetadata.signature,
+                });
+            }
+        }
+
+        const shouldEnable = before.enabled === true;
+        if (shouldEnable) this._deactivateRecord(before);
+        let targetActivated = false;
+        try {
+            if (shouldEnable) {
+                this._activateRecord(target);
+                targetActivated = true;
+            }
+            let result;
+            const committed = this._commit(
+                (state) => {
+                    const task = this._createTask(state, {
+                        extensionId: canonicalId,
+                        action: 'rollback',
+                        idempotencyKey: input.idempotencyKey,
+                    });
+                    const restoredRecord = {
+                        ...clone(target),
+                        rollbackHistory: clone(history.slice(0, targetIndex)),
+                        enabled: shouldEnable,
+                        codeStatus: shouldEnable
+                            ? this.env.isNode
+                                ? 'verified-package-active'
+                                : 'embedded-active'
+                            : this.env.isNode
+                            ? 'verified-package-inactive'
+                            : 'embedded-inactive',
+                        updatedAt: now(),
+                    };
+                    state.installed[canonicalId] = restoredRecord;
+                    state.dataGeneration += 1;
+                    const status = shouldEnable
+                        ? 'rolled-back-enabled'
+                        : 'rolled-back-disabled';
+                    this._finishTask(state, task, {
+                        extensionId: canonicalId,
+                        status,
+                        fromVersion: before.version,
+                        version: restoredRecord.version,
+                    });
+                    this._recordAudit(state, {
+                        action: 'rollback',
+                        extensionId: canonicalId,
+                        result: status,
+                        fromVersion: before.version,
+                        version: restoredRecord.version,
+                    });
+                    result = {
+                        taskId: task.id,
+                        status,
+                        record: publicRecord(restoredRecord),
+                    };
+                    return state;
+                },
+                { expectedRevision: input.expectedRevision },
+            );
+            const task = committed.tasks.find(
+                (candidate) => candidate.id === result.taskId,
+            );
+            if (task) result.task = clone(task);
+            try {
+                this.packageStore?.removeVersion?.(before);
+                for (const discarded of history.slice(targetIndex + 1)) {
+                    this.packageStore?.removeVersion?.(discarded);
+                }
+            } catch (cleanupError) {
+                result.cleanupWarning = {
+                    code:
+                        cleanupError.code || 'EXTENSION_PACKAGE_CLEANUP_FAILED',
+                    message: cleanupError.message,
+                };
+            }
+            return result;
+        } catch (error) {
+            if (targetActivated) {
+                try {
+                    this._deactivateRecord(target);
+                } catch (deactivationError) {
+                    error.deactivationError = deactivationError;
+                }
+            }
+            if (shouldEnable) {
+                try {
+                    this._activateRecord(before);
+                } catch (restoreError) {
+                    error.restoreError = restoreError;
+                }
+            }
+            throw error;
+        }
     }
 
     purgeData(extensionId) {
@@ -2346,10 +4496,9 @@ export class ExtensionManager {
 
     getFeatureFlags() {
         const flags = {};
-        for (const entry of this.bundledCatalog) {
+        for (const entry of [...this.bundledCatalog, ...this.officialCatalog]) {
             const manifest = entry.manifest || entry;
-            const record = this.getRecord(manifest.id);
-            if (record?.enabled) {
+            if (this.getAvailability(manifest.id).status === 'enabled') {
                 for (const feature of manifest.contributes?.features || []) {
                     flags[feature] = true;
                     if (manifest.id === EXTENSION_IDS.configGenerator) {

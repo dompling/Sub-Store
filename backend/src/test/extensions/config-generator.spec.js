@@ -1,49 +1,42 @@
 import { expect } from 'chai';
-import { afterEach, describe, it } from 'mocha';
+import { after, afterEach, before, describe, it } from 'mocha';
 import $ from '@/core/app';
 import YAML from '@/utils/yaml';
 import { COLLECTIONS_KEY, CONFIG_GENERATOR_KEY, SUBS_KEY } from '@/constants';
 import { produceArtifact } from '@/restful/sync';
 
 import {
-    parseProfileSections,
-    replaceManagedSections,
-    serializeProfileSections,
-} from '@/extensions/config-generator/core/profile-sections';
-import {
-    parseSurgeCsv,
-    serializeSurgeCsv,
-} from '@/extensions/config-generator/targets/surge/serializer';
-import { generateSurgeConfig } from '@/extensions/config-generator/targets/surge/generator';
-import { importSurgeConfig } from '@/extensions/config-generator/targets/surge/importer';
-import { generateQXConfig } from '@/extensions/config-generator/targets/qx/generator';
-import { importQXConfig } from '@/extensions/config-generator/targets/qx/importer';
-import { generateClashConfig } from '@/extensions/config-generator/targets/clash/generator';
-import { importClashConfig } from '@/extensions/config-generator/targets/clash/importer';
-import { generateLoonConfig } from '@/extensions/config-generator/targets/loon/generator';
-import { importLoonConfig } from '@/extensions/config-generator/targets/loon/importer';
-import {
-    validateProject,
     ConfigGeneratorValidationError,
-} from '@/extensions/config-generator/validation';
-import { resolveRuleSetUrl } from '@/extensions/config-generator/core/rule-set-source-resolver';
-import {
-    getTargetIds,
-    normalizeTargetId,
-    resolvePolicyGroupCapability,
-} from '@/extensions/config-generator/core/target-capabilities';
-import {
-    policyGroupCapabilityDiagnostics,
-    projectIncludedPolicyGroups,
-} from '@/extensions/config-generator/core/policy-group-projection';
-import {
-    createRemoteProxySourceContext,
-    projectGroupRemoteProxySource,
-} from '@/extensions/config-generator/core/remote-proxy-source';
-import {
     configGeneratorArtifactSource,
+    createRemoteProxySourceContext,
+    generateClashConfig,
+    generateLoonConfig,
+    generateQXConfig,
+    generateSurgeConfig,
+    getTargetIds,
+    importClashConfig,
+    importLoonConfig,
+    importQXConfig,
+    importSurgeConfig,
+    normalizeTargetId,
+    parseProfileSections,
+    parseSurgeCsv,
+    policyGroupCapabilityDiagnostics,
+    projectGroupRemoteProxySource,
+    projectIncludedPolicyGroups,
     registerConfigGeneratorRoutes,
-} from '@/extensions/config-generator';
+    registerEmbeddedConfigGenerator,
+    replaceManagedSections,
+    resolvePolicyGroupCapability,
+    resolveRuleSetUrl,
+    serializeProfileSections,
+    serializeSurgeCsv,
+    unbindConfigGeneratorSdk,
+    validateProject,
+} from '@/extensions/embedded/config-generator';
+import { resetExtensionManagerForTests } from '@/extensions/manager';
+import { initializeExtensionHost } from '@/extensions/host';
+import { clearExtensionRegistryForTests } from '@/extensions/registry';
 
 function createRouteApp() {
     const handlers = new Map();
@@ -119,9 +112,27 @@ describe('config generator Surge extension', function () {
     const originalRead = $.read.bind($);
     const originalWrite = $.write.bind($);
 
+    before(function () {
+        clearExtensionRegistryForTests();
+        initializeExtensionHost({
+            reset: true,
+            store: $,
+            env: { isQX: true },
+            registerEmbeddedExtensions: registerEmbeddedConfigGenerator,
+            adoptLegacy: false,
+            restoreEnabled: false,
+        });
+    });
+
     afterEach(function () {
         $.read = originalRead;
         $.write = originalWrite;
+    });
+
+    after(function () {
+        unbindConfigGeneratorSdk();
+        resetExtensionManagerForTests();
+        clearExtensionRegistryForTests();
     });
 
     it('parses and replaces managed sections while preserving preamble and unmanaged sections', function () {
