@@ -198,6 +198,21 @@ export function normalizeExtensionSourceUrl(rawValue) {
         // Retain them while intentionally dropping fragments.
         parsed.search = search;
     }
+    const rawParts = parsed.pathname.split('/').filter(Boolean);
+    if (
+        parsed.hostname.toLowerCase() === 'raw.githubusercontent.com' &&
+        rawParts.length >= 6 &&
+        rawParts[2] === 'refs' &&
+        rawParts[3] === 'heads' &&
+        (rawParts[4] === 'main' || rawParts[4] === 'master')
+    ) {
+        parsed.pathname = `/${[
+            rawParts[0],
+            rawParts[1],
+            rawParts[4],
+            ...rawParts.slice(5),
+        ].join('/')}`;
+    }
     parsed.hash = '';
     return parsed.toString();
 }

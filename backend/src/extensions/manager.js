@@ -413,6 +413,15 @@ function extensionIdsFromSources(sources = {}) {
     return ids;
 }
 
+function sourceCanReplaceRemovedInstallation(record) {
+    return Boolean(
+        record &&
+            record.installationStatus === 'removed' &&
+            record.codeStatus === 'removed' &&
+            record.enabled !== true,
+    );
+}
+
 function stateRecordFromBundled(entry) {
     const manifest = entry.manifest;
     return {
@@ -1596,6 +1605,7 @@ export class ExtensionManager {
     }
 
     _assertCommunityIdAvailable(entries, sourceId) {
+        const state = this.readState();
         const builtInIds = new Set(
             [...this.bundledCatalog, ...this.officialCatalog].map(
                 (entry) => (entry.manifest || entry).id,
@@ -1619,7 +1629,12 @@ export class ExtensionManager {
                 );
             }
             const existing = this.findEntry(entry.id);
-            if (existing && !isSourceDistribution(existing.distribution)) {
+            const retained = state.installed?.[entry.id];
+            if (
+                existing &&
+                !isSourceDistribution(existing.distribution) &&
+                !sourceCanReplaceRemovedInstallation(retained)
+            ) {
                 throw errorWithCode(
                     'EXTENSION_SOURCE_ID_RESERVED',
                     `Community source cannot replace extension ${entry.id}`,

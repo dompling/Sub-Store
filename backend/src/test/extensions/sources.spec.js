@@ -347,6 +347,13 @@ describe('Community extension sources', function () {
         ).to.equal(
             'https://raw.githubusercontent.com/example/repo/main/catalog.json?channel=beta',
         );
+        expect(
+            normalizeExtensionSourceUrl(
+                'https://raw.githubusercontent.com/example/repo/refs/heads/main/repository/catalog.json',
+            ),
+        ).to.equal(
+            'https://raw.githubusercontent.com/example/repo/main/repository/catalog.json',
+        );
         expect(() =>
             normalizeExtensionSourceUrl(
                 'https://user:pass@example.com/catalog.json',
@@ -816,6 +823,91 @@ describe('Community extension sources', function () {
         expect(manager.getSources()[0].publisher).to.deep.equal(
             refreshError.source.publisher,
         );
+    });
+
+    it('lets a verified source replace a removed local installation while retaining its data', async function () {
+        const repository = executableRelease();
+        const manifest = repository.packageDocument.manifest;
+        const basePath = fs.mkdtempSync(
+            path.join(os.tmpdir(), 'sub-store-source-after-local-'),
+        );
+        const store = createStore({
+            schemaVersion: 1,
+            revision: 1,
+            storeRevision: 1,
+            dataGeneration: 0,
+            installed: {
+                [EXECUTABLE_EXTENSION_ID]: {
+                    extensionId: EXECUTABLE_EXTENSION_ID,
+                    version: manifest.version,
+                    kind: manifest.kind,
+                    manifestSnapshot: clone(manifest),
+                    selectedVariant: 'node',
+                    implementation: {
+                        id: manifest.variants.node.implementationId,
+                        abi: manifest.variants.node.implementationAbi,
+                        entrypoint: manifest.variants.node.entrypoint,
+                        containsExecutableCode: true,
+                    },
+                    distribution: 'local-executable',
+                    source: 'local-upload',
+                    sourceId: null,
+                    sourceUrl: null,
+                    installationStatus: 'removed',
+                    dataStatus: 'retained',
+                    retainedReason: 'user-uninstalled',
+                    enabled: false,
+                    codeStatus: 'removed',
+                    compatibilityStatus: 'compatible',
+                    verificationMode: 'local-integrity',
+                },
+            },
+            sources: {},
+            migrations: {},
+            tasks: [],
+            audit: [],
+        });
+        try {
+            const manager = new ExtensionManager({
+                store,
+                env: { isNode: true },
+                packageStore: createNodeExtensionPackageStore({ basePath }),
+                sourceFetcher: async (url) =>
+                    response(
+                        url === repository.sourceUrl
+                            ? repository.catalog
+                            : repository.packageDocument,
+                    ),
+            });
+
+            expect(
+                manager.getAvailability(EXECUTABLE_EXTENSION_ID),
+            ).to.include({
+                status: 'reinstall-required',
+                retainedReason: 'user-uninstalled',
+            });
+
+            const source = await manager.addSource({
+                url: repository.sourceUrl,
+                name: 'Example source',
+            });
+            expect(manager.findEntry(EXECUTABLE_EXTENSION_ID)).to.include({
+                distribution: 'source-executable',
+                sourceId: source.id,
+            });
+
+            const installed = await manager.installFromSource(
+                EXECUTABLE_EXTENSION_ID,
+            );
+            expect(installed.record).to.include({
+                distribution: 'source-executable',
+                sourceId: source.id,
+                dataStatus: 'active',
+                codeStatus: 'verified-package-installed',
+            });
+        } finally {
+            fs.rmSync(basePath, { recursive: true, force: true });
+        }
     });
 
     it('installs a digest executable only after its source is added and keeps it verifiable', async function () {
