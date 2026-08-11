@@ -1,0 +1,6 @@
+# These browser-selectable packages are signed byte-for-byte. Reformatting a
+# payload file invalidates its package digest and Ed25519 signature.
+extension-packages/
+# Generated GitHub/HTTPS transport envelopes are verified structurally by the
+# release gate and can contain large signed JavaScript strings.
+extension-repository/

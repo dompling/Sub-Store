@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "extensionId": "org.substore.config-generator",
+  "version": "1.1.0",
+  "publisher": {
+    "id": "org.substore",
+    "name": "Sub-Store",
+    "verified": true
+  },
+  "selectedVariant": "node",
+  "manifestDigest": "366388a704e832645b38fc484efe0abe25911146fa418b6ec0e744016267765d",
+  "packageDigest": "c9dced66d67dc80e22587e719a71fe140c9036e71cfacee0c5c4735b962d7ba0",
+  "implementation": {
+    "id": "org.substore.config-generator@1/node",
+    "abi": "config-generator@1",
+    "frontendAssetId": "org.substore.config-generator-ui@1",
+    "entrypoint": "backend/index.cjs",
+    "lanes": {
+      "simple": {
+        "product": "sub-store-0",
+        "implementationId": "org.substore.config-generator@1/simple"
+      },
+      "parser": {
+        "product": "sub-store-1",
+        "implementationId": "org.substore.config-generator@1/parser"
+      }
+    },
+    "containsExecutableCode": true
+  },
+  "installedAt": 1786320000000,
+  "receiptDigest": "28a10cabf1579af3443e1b239a15eb9ff64916756a9d8033a0b23096c428618f"
+}

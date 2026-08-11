@@ -1,0 +1,188 @@
+{
+    "schemaVersion": 1,
+    "id": "org.substore.config-generator",
+    "kind": "trusted-official",
+    "distribution": "store",
+    "name": "配置生成器",
+    "description": "生成 Surge、Quantumult X、Clash 和 Loon 配置",
+    "version": "1.1.0",
+    "publisher": {
+        "id": "org.substore",
+        "name": "Sub-Store",
+        "verified": true
+    },
+    "license": "GPL-3.0",
+    "homepage": "https://github.com/sub-store-org/Sub-Store",
+    "trust": {
+        "level": "official-root",
+        "allowedPublisher": "org.substore",
+        "allowlistedId": true
+    },
+    "host": {
+        "apiVersion": "1.0.0",
+        "frontendApiVersion": "1.0.0",
+        "backend": ">=2.36.31",
+        "implementationAbi": "config-generator@1",
+        "runtimes": [
+            "node",
+            "qx",
+            "loon",
+            "surge",
+            "stash",
+            "shadowrocket",
+            "egern"
+        ]
+    },
+    "frontend": {
+        "entrypoint": "frontend/index.js",
+        "style": "frontend/style.css",
+        "sdkSpecifier": "@substore/frontend-sdk/v1",
+        "uiKitAbi": "substore-ui-kit@1",
+        "implementationAbi": "config-generator-ui@1",
+        "routeBase": "/extensions/config-generator",
+        "openPath": "/extensions/config-generator",
+        "embeddedBasePath": "extensions/org.substore.config-generator/1.1.0",
+        "assets": {
+            "entrypoint": {
+                "path": "frontend/index.js",
+                "digest": "4c998eff193e05588e5600510a5080fe07cad24f0b87bb87f6ea83d1c87f685c"
+            },
+            "style": {
+                "path": "frontend/style.css",
+                "digest": "099ed896b683b1e71ecffb6d427c4071b4a12683f74a7be4477c91415d4ead32"
+            }
+        }
+    },
+    "entrypoints": {
+        "backend": {
+            "mode": "trusted-package",
+            "path": "backend/index.cjs"
+        }
+    },
+    "variants": {
+        "node": {
+            "delivery": "trusted-package",
+            "packageKind": "local-official-receipt",
+            "implementationId": "org.substore.config-generator@1/node",
+            "implementationAbi": "config-generator@1",
+            "frontendAssetId": "org.substore.config-generator-ui@1",
+            "entrypoint": "backend/index.cjs",
+            "containsExecutableCode": true
+        },
+        "qx": {
+            "delivery": "embedded-receipt",
+            "implementationId": "org.substore.config-generator@1/qx",
+            "implementationAbi": "config-generator@1",
+            "frontendAssetId": "org.substore.config-generator-ui@1",
+            "containsExecutableCode": false
+        },
+        "loon": {
+            "delivery": "embedded-receipt",
+            "implementationId": "org.substore.config-generator@1/loon",
+            "implementationAbi": "config-generator@1",
+            "frontendAssetId": "org.substore.config-generator-ui@1",
+            "containsExecutableCode": false
+        },
+        "surge": {
+            "delivery": "embedded-receipt",
+            "implementationId": "org.substore.config-generator@1/surge",
+            "implementationAbi": "config-generator@1",
+            "frontendAssetId": "org.substore.config-generator-ui@1",
+            "containsExecutableCode": false
+        },
+        "default-script-runtime": {
+            "delivery": "embedded-receipt",
+            "implementationId": "org.substore.config-generator@1/script",
+            "implementationAbi": "config-generator@1",
+            "frontendAssetId": "org.substore.config-generator-ui@1",
+            "containsExecutableCode": false
+        }
+    },
+    "permissions": [
+        {
+            "name": "storage.own",
+            "reason": "保存配置项目与规则集"
+        },
+        {
+            "name": "resources.read",
+            "scope": ["subscriptions", "collections", "files", "artifacts"],
+            "reason": "把现有节点与文件融合到配置项目"
+        },
+        {
+            "name": "network.fetch",
+            "scope": ["user-configured-https", "user-configured-http"],
+            "reason": "读取用户配置的远程订阅和规则集"
+        },
+        {
+            "name": "artifact.produce",
+            "scope": ["subscription", "collection", "file", "rule"]
+        },
+        {
+            "name": "artifact-source.register",
+            "scope": ["config-project"]
+        },
+        {
+            "name": "routes.namespaced"
+        },
+        {
+            "name": "navigation.register"
+        }
+    ],
+    "contributes": {
+        "features": ["org.substore.config-generator.configGenerator"],
+        "routes": [
+            "org.substore.config-generator.list",
+            "org.substore.config-generator.edit",
+            "org.substore.config-generator.import",
+            "org.substore.config-generator.preview",
+            "org.substore.config-generator.download"
+        ],
+        "artifactSources": [
+            {
+                "id": "org.substore.config-generator.config-project",
+                "type": "config-project",
+                "labelKey": "artifactSource",
+                "platforms": ["Surge", "QX", "Clash", "Loon"]
+            }
+        ],
+        "navigation": ["org.substore.config-generator.main"],
+        "pageActions": [
+            "org.substore.config-generator.add",
+            "org.substore.config-generator.import"
+        ]
+    },
+    "scriptExecutionLanes": {
+        "simple": {
+            "product": "sub-store-0",
+            "implementationId": "org.substore.config-generator@1/simple",
+            "routes": [
+                "projects",
+                "projects/:name",
+                "project/:name",
+                "rule-sets",
+                "rule-set/:name"
+            ]
+        },
+        "parser": {
+            "product": "sub-store-1",
+            "implementationId": "org.substore.config-generator@1/parser",
+            "routes": [
+                "preview/:target",
+                "import/:target",
+                "download/config-project/**"
+            ]
+        }
+    },
+    "storage": {
+        "schemaVersion": 1,
+        "legacyKeys": ["configGenerator"]
+    },
+    "legacy": {
+        "id": "config-generator",
+        "feature": "configGenerator",
+        "routes": [
+            "/api/extensions/config-generator/**",
+            "/download/config-project/**"
+        ]
+    }
+}
