@@ -4,7 +4,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { ARTIFACTS_KEY, CONFIG_GENERATOR_KEY } from '@/constants';
+import { ARTIFACTS_KEY } from '@/constants';
 import {
     EXTENSION_IDS,
     canonicalJson,
@@ -27,15 +27,18 @@ import { sha256Hex, verifySignedEnvelope } from '@/extensions/signature';
 import { initializeExtensionHost } from '@/extensions/host';
 import { registerExtensionControlRoutes } from '@/restful/extensions';
 import configHostingManifest from '@/extensions/config-hosting/manifest.json';
-import configGeneratorManifest from '@/extensions/official-packages/org.substore.config-generator/manifest.json';
 import {
     createConfigHostingAdapter,
     createConfigHostingRouteApps,
 } from '@/extensions/config-hosting';
 import {
     clearExtensionRegistryForTests,
+    registerExtension,
     resolveExtensionRouteLane,
 } from '@/extensions/registry';
+
+const EXTERNAL_CONFIG_GENERATOR_ID = 'org.substore.config-generator';
+const GENERIC_REMOTE_EXTENSION_ID = 'org.example.remote-extension';
 
 function createStore(initial) {
     return createKeyStore(
@@ -164,18 +167,59 @@ describe('Extension Host foundation', function () {
             'simple',
         );
         expect(routeExecutionLane(manifest, 'missing')).to.equal(null);
-        expect(
-            resolveExtensionRouteLane(
-                EXTENSION_IDS.configGenerator,
-                '/api/extensions/config-generator/preview/qx',
-            ),
-        ).to.equal('parser');
-        expect(
-            resolveExtensionRouteLane(
-                EXTENSION_IDS.configGenerator,
-                '/api/extensions/config-generator/projects',
-            ),
-        ).to.equal('simple');
+        const externalManifest = normalizeExtensionManifest({
+            schemaVersion: 1,
+            id: GENERIC_REMOTE_EXTENSION_ID,
+            kind: 'executable',
+            name: 'Generic remote extension',
+            version: '1.0.0',
+            publisher: { id: 'org.substore', name: 'Sub-Store' },
+            host: { apiVersion: '1.0.0', runtimes: ['node'] },
+            variants: {
+                node: {
+                    implementationId: `${GENERIC_REMOTE_EXTENSION_ID}@1/node`,
+                    implementationAbi: 'remote-extension@1',
+                    entrypoint: 'backend/index.cjs',
+                    containsExecutableCode: true,
+                },
+            },
+            scriptExecutionLanes: {
+                simple: {
+                    product: 'sub-store-0',
+                    routes: ['projects'],
+                },
+                parser: {
+                    product: 'sub-store-1',
+                    routes: ['preview/:target', 'download/config-project/**'],
+                },
+            },
+        });
+        registerExtension({
+            extensionId: GENERIC_REMOTE_EXTENSION_ID,
+            manifest: externalManifest,
+        });
+        try {
+            expect(
+                resolveExtensionRouteLane(
+                    GENERIC_REMOTE_EXTENSION_ID,
+                    '/api/extensions/remote-extension/preview/qx',
+                ),
+            ).to.equal('parser');
+            expect(
+                resolveExtensionRouteLane(
+                    GENERIC_REMOTE_EXTENSION_ID,
+                    '/api/extensions/remote-extension/projects',
+                ),
+            ).to.equal('simple');
+            expect(
+                resolveExtensionRouteLane(
+                    GENERIC_REMOTE_EXTENSION_ID,
+                    '/download/config-project/demo/QX',
+                ),
+            ).to.equal('parser');
+        } finally {
+            clearExtensionRegistryForTests();
+        }
     });
 
     it('verifies the generated catalog and local packages with the built-in release root', function () {
@@ -185,90 +229,58 @@ describe('Extension Host foundation', function () {
         expect(result.valid).to.equal(true);
         expect(result.trust).to.equal('trusted');
         expect(canonicalJson(signedExtensionCatalog.payload)).to.be.a('string');
-        for (const extensionId of [
-            EXTENSION_IDS.configGenerator,
-            EXTENSION_IDS.configHosting,
-        ]) {
-            const runtimes =
-                extensionId === EXTENSION_IDS.configGenerator
-                    ? ['qx', 'loon', 'surge', 'stash']
-                    : ['node', 'qx', 'loon', 'surge', 'stash'];
-            for (const runtime of runtimes) {
-                const packageInput = createLocalOfficialPackage(
-                    extensionId,
-                    runtime,
-                );
-                const packageResult = verifySignedEnvelope(
-                    {
-                        payload: packageInput.payload,
-                        signature: packageInput.signature,
-                    },
-                    { trustedKeys: officialExtensionTrustedKeys },
-                );
-                expect(packageResult).to.include({
-                    valid: true,
-                    trust: 'trusted',
-                });
-                const signedEntry = signedExtensionCatalog.payload.entries.find(
-                    (entry) => entry.id === extensionId,
-                );
-                expect(
-                    signedEntry.packageDigests[packageInput.selectedVariant],
-                ).to.equal(packageInput.packageDigest);
-            }
+        for (const runtime of ['node', 'qx', 'loon', 'surge', 'stash']) {
+            const packageInput = createLocalOfficialPackage(
+                EXTENSION_IDS.configHosting,
+                runtime,
+            );
+            const packageResult = verifySignedEnvelope(
+                {
+                    payload: packageInput.payload,
+                    signature: packageInput.signature,
+                },
+                { trustedKeys: officialExtensionTrustedKeys },
+            );
+            expect(packageResult).to.include({
+                valid: true,
+                trust: 'trusted',
+            });
+            const signedEntry = signedExtensionCatalog.payload.entries.find(
+                (entry) => entry.id === EXTENSION_IDS.configHosting,
+            );
+            expect(
+                signedEntry.packageDigests[packageInput.selectedVariant],
+            ).to.equal(packageInput.packageDigest);
         }
+        expect(
+            createLocalOfficialPackage(EXTERNAL_CONFIG_GENERATOR_ID, 'node'),
+        ).to.equal(null);
     });
 
-    it('models config-generator as an official package rather than a bundled lifecycle record', function () {
-        expect(configGeneratorManifest).to.include({
-            kind: 'trusted-official',
-            distribution: 'store',
-        });
-        expect(configGeneratorManifest.variants.node).to.include({
-            entrypoint: 'backend/index.cjs',
-            containsExecutableCode: true,
-        });
+    it('does not seed the third-party config-generator without an installed source', function () {
         const manager = new ExtensionManager({
             store: createStore(undefined),
             env: { isNode: true },
         });
+        expect(manager.findEntry(EXTERNAL_CONFIG_GENERATOR_ID)).to.equal(null);
         expect(
-            manager.getAvailability(EXTENSION_IDS.configGenerator).status,
+            manager.getCatalog().entries.map((entry) => entry.id),
+        ).to.not.include(EXTERNAL_CONFIG_GENERATOR_ID);
+        expect(
+            manager.getRuntimeManifest().extensions.map((entry) => entry.id),
+        ).to.not.include(EXTERNAL_CONFIG_GENERATOR_ID);
+        expect(
+            manager.getAvailability(EXTERNAL_CONFIG_GENERATOR_ID).status,
         ).to.equal('missing');
-    });
-
-    it('binds the synchronized script artifact to Host-owned provenance metadata', function () {
-        const metadata = JSON.parse(
-            fs.readFileSync(
-                path.resolve(
-                    process.cwd(),
-                    'src/extensions/embedded/org.substore.config-generator.generated.json',
-                ),
-                'utf8',
-            ),
-        );
-        const artifact = fs.readFileSync(
-            path.resolve(
-                process.cwd(),
-                'src/extensions/embedded/org.substore.config-generator.generated.js',
-            ),
-        );
-        expect(metadata).to.include({
-            extensionId: EXTENSION_IDS.configGenerator,
-            version: configGeneratorManifest.version,
-            implementationAbi: configGeneratorManifest.host.implementationAbi,
-            packageDigest: signedExtensionCatalog.payload.entries.find(
-                (entry) => entry.id === EXTENSION_IDS.configGenerator,
-            ).packageDigests.node,
-        });
-        expect(sha256Hex(artifact)).to.equal(metadata.artifactSha256);
         expect(
-            embeddedExtensionImplementations[EXTENSION_IDS.configGenerator],
-        ).to.include({
-            implementationAbi: metadata.implementationAbi,
-            artifactSha256: metadata.artifactSha256,
-            sourceTreeSha256: metadata.sourceTreeSha256,
-        });
+            createLocalOfficialPackage(EXTERNAL_CONFIG_GENERATOR_ID, 'node'),
+        ).to.equal(null);
+        expect(embeddedExtensionImplementations).to.not.have.property(
+            EXTERNAL_CONFIG_GENERATOR_ID,
+        );
+        expect(() => manager.install(EXTERNAL_CONFIG_GENERATOR_ID))
+            .to.throw()
+            .with.property('code', 'EXTENSION_SOURCE_NOT_FOUND');
     });
 
     it('keeps digest-only verification disabled by default and reports its trust mode accurately', function () {
@@ -528,8 +540,8 @@ describe('Extension Host foundation', function () {
     });
 
     it('migrates aggregate lifecycle records into one root key per extension', function () {
-        const configGeneratorRecord = {
-            extensionId: EXTENSION_IDS.configGenerator,
+        const remoteExtensionRecord = {
+            extensionId: GENERIC_REMOTE_EXTENSION_ID,
             version: '1.1.0',
             installationStatus: 'installed',
             dataStatus: 'active',
@@ -549,7 +561,7 @@ describe('Extension Host foundation', function () {
                 storeRevision: 7,
                 dataGeneration: 3,
                 installed: {
-                    [EXTENSION_IDS.configGenerator]: configGeneratorRecord,
+                    [GENERIC_REMOTE_EXTENSION_ID]: remoteExtensionRecord,
                     [EXTENSION_IDS.configHosting]: configHostingRecord,
                 },
                 sources: {},
@@ -572,16 +584,16 @@ describe('Extension Host foundation', function () {
         const index = JSON.parse(store.read('#sub-store-extension-index'));
         expect(index).to.not.have.property('installed');
         expect(index.extensionIds).to.have.members([
-            EXTENSION_IDS.configGenerator,
+            GENERIC_REMOTE_EXTENSION_ID,
             EXTENSION_IDS.configHosting,
         ]);
         expect(
             JSON.parse(
                 store.read(
-                    `#sub-store-extension:${EXTENSION_IDS.configGenerator}`,
+                    `#sub-store-extension:${GENERIC_REMOTE_EXTENSION_ID}`,
                 ),
             ),
-        ).to.deep.equal(configGeneratorRecord);
+        ).to.deep.equal(remoteExtensionRecord);
         expect(
             JSON.parse(
                 store.read(
@@ -599,8 +611,8 @@ describe('Extension Host foundation', function () {
                 storeRevision: 2,
                 dataGeneration: 1,
                 installed: {
-                    [EXTENSION_IDS.configGenerator]: {
-                        extensionId: EXTENSION_IDS.configGenerator,
+                    [GENERIC_REMOTE_EXTENSION_ID]: {
+                        extensionId: GENERIC_REMOTE_EXTENSION_ID,
                         version: '1.1.0',
                         enabled: false,
                     },
@@ -624,12 +636,12 @@ describe('Extension Host foundation', function () {
         manager.readState();
         store.resetWrittenKeys();
         manager._commit((state) => {
-            state.installed[EXTENSION_IDS.configGenerator].enabled = true;
+            state.installed[GENERIC_REMOTE_EXTENSION_ID].enabled = true;
             return state;
         });
 
         expect(store.writtenKeys()).to.deep.equal([
-            `#sub-store-extension:${EXTENSION_IDS.configGenerator}`,
+            `#sub-store-extension:${GENERIC_REMOTE_EXTENSION_ID}`,
             '#sub-store-extension-index',
         ]);
     });
@@ -654,7 +666,7 @@ describe('Extension Host foundation', function () {
                 { headers: {} },
                 runtimeResponse,
             );
-            expect(runtimeResponse.body.data.extensions).to.have.length(2);
+            expect(runtimeResponse.body.data.extensions).to.have.length(1);
             expect(runtimeResponse.body.data.managementMode).to.equal('open');
             expect(runtimeResponse.headers.ETag).to.equal(
                 `W/"extensions-${runtimeResponse.body.data.storageIdentity}-${runtimeResponse.body.data.revision}"`,
@@ -668,6 +680,9 @@ describe('Extension Host foundation', function () {
             expect(
                 catalogResponse.body.data.entries.map((item) => item.id),
             ).to.include(EXTENSION_IDS.configHosting);
+            expect(
+                catalogResponse.body.data.entries.map((item) => item.id),
+            ).to.not.include(GENERIC_REMOTE_EXTENSION_ID);
 
             const sourcesResponse = createResponse();
             await handlers.get('GET /api/extensions/sources')(
@@ -689,6 +704,20 @@ describe('Extension Host foundation', function () {
             expect(installResponse.statusCode).to.equal(201);
             expect(installResponse.body.data.status).to.equal(
                 'installed-disabled',
+            );
+
+            const missingSourceInstallResponse = createResponse();
+            await handlers.get('POST /api/admin/extensions/:id/install')(
+                {
+                    params: { id: GENERIC_REMOTE_EXTENSION_ID },
+                    body: {},
+                    headers: {},
+                },
+                missingSourceInstallResponse,
+            );
+            expect(missingSourceInstallResponse.statusCode).to.equal(404);
+            expect(missingSourceInstallResponse.body.error.code).to.equal(
+                'EXTENSION_SOURCE_NOT_FOUND',
             );
         } finally {
             if (previousToken === undefined)
@@ -1002,107 +1031,6 @@ describe('Extension Host foundation', function () {
             fs.rmSync(basePath, { recursive: true, force: true });
             fs.rmSync(`${basePath}-fresh`, { recursive: true, force: true });
             fs.rmSync(`${basePath}-failed`, { recursive: true, force: true });
-        }
-    });
-
-    it('retains legacy config-generator data until its remote Node package is installed', function () {
-        const basePath = fs.mkdtempSync(
-            path.join(os.tmpdir(), 'sub-store-config-generator-adoption-'),
-        );
-        const legacyValue = {
-            version: 1,
-            projects: [{ name: 'legacy-project', rules: [] }],
-            ruleSets: [{ name: 'legacy-rules', rules: [] }],
-        };
-        try {
-            const legacyStore = createKeyStore({
-                [CONFIG_GENERATOR_KEY]: legacyValue,
-            });
-            const packageStore = createNodeExtensionPackageStore({ basePath });
-            const host = initializeExtensionHost({
-                reset: true,
-                store: legacyStore,
-                env: { isNode: true },
-                packageStore,
-                restoreEnabled: false,
-            });
-            expect(
-                host.manager.getRecord(EXTENSION_IDS.configGenerator),
-            ).to.include({
-                installationStatus: 'removed',
-                dataStatus: 'retained',
-                retainedReason: 'legacy-data',
-                codeStatus: 'missing',
-                adoptionStatus: 'reinstall-required',
-            });
-            expect(
-                host.manager.getAvailability(EXTENSION_IDS.configGenerator)
-                    .status,
-            ).to.equal('reinstall-required');
-            expect(legacyStore.read(CONFIG_GENERATOR_KEY)).to.deep.equal(
-                legacyValue,
-            );
-            const revision = host.manager.getRuntimeManifest().revision;
-            expect(
-                host.manager.adoptLegacyConfigGeneratorIfNeeded(),
-            ).to.include({
-                status: 'reinstall-required',
-                reasonCode: 'EXTENSION_SOURCE_PACKAGE_REQUIRED',
-                previouslyAttempted: true,
-            });
-            expect(host.manager.getRuntimeManifest().revision).to.equal(
-                revision,
-            );
-
-            let installError;
-            try {
-                host.manager.install(EXTENSION_IDS.configGenerator);
-            } catch (error) {
-                installError = error;
-            }
-            expect(installError).to.include({
-                code: 'EXTENSION_SOURCE_PACKAGE_REQUIRED',
-            });
-            expect(installError.details).to.include({
-                extensionId: EXTENSION_IDS.configGenerator,
-                localDirectorySupported: true,
-            });
-
-            resetExtensionManagerForTests();
-            const freshStore = createKeyStore();
-            const freshHost = initializeExtensionHost({
-                reset: true,
-                store: freshStore,
-                env: { isNode: true },
-                packageStore: createNodeExtensionPackageStore({
-                    basePath: `${basePath}-fresh`,
-                }),
-                restoreEnabled: false,
-            });
-            expect(
-                freshHost.manager.getAvailability(EXTENSION_IDS.configGenerator)
-                    .status,
-            ).to.equal('missing');
-            expect(freshStore.read(CONFIG_GENERATOR_KEY)).to.equal(undefined);
-            expect(freshStore.writes()).to.equal(0);
-
-            const scriptManager = new ExtensionManager({
-                store: createStore(undefined),
-                env: { isQX: true },
-            });
-            expect(
-                scriptManager.getAvailability(EXTENSION_IDS.configGenerator)
-                    .status,
-            ).to.equal('enabled');
-            expect(
-                scriptManager.getRecord(EXTENSION_IDS.configGenerator)
-                    .selectedVariant,
-            ).to.equal('qx');
-        } finally {
-            clearExtensionRegistryForTests();
-            resetExtensionManagerForTests();
-            fs.rmSync(basePath, { recursive: true, force: true });
-            fs.rmSync(`${basePath}-fresh`, { recursive: true, force: true });
         }
     });
 

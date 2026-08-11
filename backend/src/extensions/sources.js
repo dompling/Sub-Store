@@ -18,7 +18,7 @@ export const MAX_EXTENSION_SOURCE_BYTES = 4 * 1024 * 1024;
 export const MAX_EXTENSION_SOURCE_ENTRIES = 128;
 export const MAX_EXTENSION_SOURCE_REDIRECTS = 3;
 export const MAX_EXTENSION_SOURCE_URL_LENGTH = 2048;
-export const TRUSTED_OFFICIAL_MIRROR_DISTRIBUTION = 'trusted-official-mirror';
+export const SOURCE_EXECUTABLE_DISTRIBUTION = 'source-executable';
 
 function nodeModule(name) {
     try {
@@ -329,10 +329,7 @@ async function assertSafeNetworkTarget(
             addresses.some(
                 (item) =>
                     isPrivateAddress(item.address) &&
-                    !isSafeHttpsProxySyntheticResolution(
-                        parsed,
-                        item.address,
-                    ),
+                    !isSafeHttpsProxySyntheticResolution(parsed, item.address),
             )
         ) {
             throw sourceError(
@@ -572,11 +569,11 @@ export function normalizeCommunityCatalog(document, sourceUrl, sourceId) {
         const manifestInput = rawEntry?.manifest || rawEntry;
         if (
             manifestInput?.kind !== 'content' &&
-            manifestInput?.kind !== 'trusted-official'
+            manifestInput?.kind !== 'executable'
         ) {
             throw sourceError(
                 'EXTENSION_COMMUNITY_EXECUTION_FORBIDDEN',
-                'Extension sources accept content extensions or trusted official package mirrors',
+                'Extension sources accept content or executable extensions',
                 { extensionId: manifestInput?.id || null },
                 422,
             );
@@ -592,14 +589,14 @@ export function normalizeCommunityCatalog(document, sourceUrl, sourceId) {
                 422,
             );
         }
-        if (manifest.kind !== 'content' && manifest.kind !== 'trusted-official')
+        if (manifest.kind !== 'content' && manifest.kind !== 'executable')
             throw sourceError(
                 'EXTENSION_COMMUNITY_EXECUTION_FORBIDDEN',
                 'Extension source manifest kind is not installable',
                 { extensionId: manifest.id },
                 422,
             );
-        const trustedOfficialMirror = manifest.kind === 'trusted-official';
+        const executable = manifest.kind === 'executable';
         const variants = Object.keys(manifest.variants || {});
         if (!variants.length)
             throw sourceError(
@@ -610,7 +607,7 @@ export function normalizeCommunityCatalog(document, sourceUrl, sourceId) {
             );
         for (const variantName of variants) {
             if (
-                !trustedOfficialMirror &&
+                !executable &&
                 manifest.variants[variantName]?.containsExecutableCode === true
             )
                 throw sourceError(
@@ -620,14 +617,27 @@ export function normalizeCommunityCatalog(document, sourceUrl, sourceId) {
                     422,
                 );
         }
-        if (trustedOfficialMirror && !variants.includes('node'))
+        if (executable && !variants.includes('node'))
             throw sourceError(
                 'EXTENSION_SOURCE_VARIANT_MISSING',
-                'Trusted official mirrors must declare a Node package variant',
+                'Executable extensions must declare a Node package variant',
                 { extensionId: manifest.id },
                 422,
             );
-        const selectedVariant = trustedOfficialMirror
+        const nodeVariant = manifest.variants?.node;
+        if (
+            executable &&
+            (nodeVariant?.containsExecutableCode !== true ||
+                typeof nodeVariant?.entrypoint !== 'string' ||
+                !nodeVariant.entrypoint)
+        )
+            throw sourceError(
+                'EXTENSION_SOURCE_EXECUTABLE_CONTRACT_INVALID',
+                'Executable extensions must declare a digest-bound Node entrypoint',
+                { extensionId: manifest.id },
+                422,
+            );
+        const selectedVariant = executable
             ? 'node'
             : variants.includes('node')
             ? 'node'
@@ -676,8 +686,8 @@ export function normalizeCommunityCatalog(document, sourceUrl, sourceId) {
             name: manifest.name,
             description: manifest.description,
             kind: manifest.kind,
-            distribution: trustedOfficialMirror
-                ? TRUSTED_OFFICIAL_MIRROR_DISTRIBUTION
+            distribution: executable
+                ? SOURCE_EXECUTABLE_DISTRIBUTION
                 : 'community',
             source: sourceUrl,
             sourceId,

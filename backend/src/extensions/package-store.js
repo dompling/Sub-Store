@@ -297,7 +297,10 @@ export class NodeExtensionPackageStore {
         this.verificationOptions = { ...options };
     }
 
-    validatePackageInput(packageInput, { allowCommunityContent = false } = {}) {
+    validatePackageInput(
+        packageInput,
+        { allowCommunityContent = false, allowDigestOnly = false } = {},
+    ) {
         const { manifest, receipt, payload, signature } = packageInput || {};
         const packageDigest = packageInput?.packageDigest;
         const selectedVariant = packageInput?.selectedVariant;
@@ -391,7 +394,7 @@ export class NodeExtensionPackageStore {
             allowCommunityContent && isCommunityContentPackage(packageInput);
         const envelopeResult = verifySignedEnvelope(
             { payload, signature },
-            communityContent
+            communityContent || allowDigestOnly
                 ? { ...this.verificationOptions, allowDigestOnly: true }
                 : this.verificationOptions,
         );
@@ -713,6 +716,9 @@ export class NodeExtensionPackageStore {
 
     verifyInstalledRecord(record) {
         if (!record?.entrypoint || !this.available) return null;
+        const allowDigestOnly =
+            record.verificationMode === 'source-integrity' ||
+            record.verificationMode === 'local-integrity';
         if (
             !isSha256Digest(record.packageDigest) ||
             !isSha256Digest(record.manifestDigest) ||
@@ -871,7 +877,9 @@ export class NodeExtensionPackageStore {
                 payload: reconstructedPayload,
                 signature: packageMetadata.signature,
             },
-            this.verificationOptions,
+            allowDigestOnly
+                ? { ...this.verificationOptions, allowDigestOnly: true }
+                : this.verificationOptions,
         );
         if (
             !envelopeResult.valid ||

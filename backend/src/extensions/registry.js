@@ -1,4 +1,5 @@
 import { findCatalogEntry } from './catalog.generated';
+import { routeExecutionLane } from './contracts';
 import { getExtensionManager } from './manager';
 import { failed } from '@/restful/response';
 
@@ -7,9 +8,6 @@ const routeHosts = [];
 
 function canonicalExtensionId(extension) {
     if (extension?.extensionId) return extension.extensionId;
-    if (extension?.id === 'config-generator') {
-        return 'org.substore.config-generator';
-    }
     return extension?.id;
 }
 
@@ -43,10 +41,7 @@ export function registerExtension(extension) {
 }
 
 export function unregisterExtension(extensionId) {
-    const canonicalId =
-        extensionId === 'config-generator'
-            ? 'org.substore.config-generator'
-            : extensionId;
+    const canonicalId = extensionId;
     const index = extensions.findIndex(
         (extension) => extension.extensionId === canonicalId,
     );
@@ -143,10 +138,7 @@ export function listRegisteredExtensions() {
 }
 
 export function getRegisteredExtension(extensionId) {
-    const canonicalId =
-        extensionId === 'config-generator'
-            ? 'org.substore.config-generator'
-            : extensionId;
+    const canonicalId = extensionId;
     return (
         extensions.find((extension) => extension.extensionId === canonicalId) ||
         null
@@ -158,24 +150,21 @@ export function clearExtensionRegistryForTests() {
     routeHosts.splice(0, routeHosts.length);
 }
 
-export function resolveExtensionRouteLane(extensionId, path) {
-    const canonicalId =
-        extensionId === 'config-generator'
-            ? 'org.substore.config-generator'
-            : extensionId;
-    if (canonicalId === 'org.substore.config-generator') {
-        return /^\/api\/extensions\/config-generator\/(preview|import)(\/|$)/.test(
-            path,
-        ) || /^\/download\/config-project(\/|$)/.test(path)
-            ? 'parser'
-            : 'simple';
-    }
-    if (canonicalId === 'org.substore.config-hosting') {
-        return /\/runtime\/(sync|preview|produce|import|download)(\/|$)/.test(
-            path,
-        )
-            ? 'parser'
-            : 'simple';
+export function resolveExtensionRouteLane(extensionId, path, method) {
+    const canonicalId = extensionId;
+    const extension = getRegisteredExtension(canonicalId);
+    const manifest =
+        extension?.manifest || findCatalogEntry(canonicalId)?.manifest || null;
+    if (manifest) {
+        const normalizedPath = `${path || ''}`.replace(/^\/+/, '');
+        const extensionRoute = normalizedPath.replace(
+            /^api\/extensions\/[^/]+\//,
+            '',
+        );
+        for (const candidate of [extensionRoute, normalizedPath]) {
+            const lane = routeExecutionLane(manifest, candidate, method);
+            if (lane) return lane;
+        }
     }
     return 'simple';
 }
@@ -192,8 +181,11 @@ function dynamicGatedApp(host, extension) {
         proxy[method] = (path, handler) => {
             if (
                 executionLane &&
-                resolveExtensionRouteLane(extension.extensionId, path) !==
-                    executionLane
+                resolveExtensionRouteLane(
+                    extension.extensionId,
+                    path,
+                    method,
+                ) !== executionLane
             ) {
                 return proxy;
             }

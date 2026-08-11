@@ -28,7 +28,6 @@ export function initializeExtensionHost(options = {}) {
     manager.registerAdapter(configHostingManifest.id, configHostingAdapter);
     options.registerEmbeddedExtensions?.(manager);
     if (options.adoptLegacy !== false) {
-        manager.adoptLegacyConfigGeneratorIfNeeded();
         manager.adoptLegacyConfigHostingIfNeeded();
     }
     if (options.restoreEnabled !== false) {

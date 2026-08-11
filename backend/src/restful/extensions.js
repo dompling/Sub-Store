@@ -340,8 +340,7 @@ export function registerExtensionControlRoutes(
                 assertNoClientPackage(req);
                 const input = lifecycleInput(req);
                 const entry = manager.findEntry(req.params.id);
-                return entry?.distribution === 'community' ||
-                    entry?.remotePackage === true
+                return entry?.sourceId
                     ? manager.installFromSource(req.params.id, input)
                     : manager.install(req.params.id, input);
             },

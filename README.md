@@ -168,8 +168,15 @@ container port `3000`, rather than the combined image's Front-End port `3001`.
 The container runs as a non-root user and stores Sub-Store data, MMDB files,
 backups, and installed extension packages under `/opt/app/data`. The default is
 the named `sub-store-data` volume. Set `SUB_STORE_DATA_PATH` in `.env` to an
-absolute host directory such as `/root/sub-store-data` to use the bind-mount
-layout shown in the official quick-start guide.
+absolute host directory to use the bind-mount layout shown in the official
+quick-start guide. Because this image runs as the non-root `node` user, that
+directory must be writable by UID/GID `1000`, for example:
+
+```bash
+sudo install -d -o 1000 -g 1000 /srv/sub-store-data
+```
+
+Then set `SUB_STORE_DATA_PATH=/srv/sub-store-data` in `.env`.
 
 ```bash
 cp .env.example .env

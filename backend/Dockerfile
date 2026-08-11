@@ -34,6 +34,6 @@ VOLUME ["/opt/app/data"]
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD ["node", "-e", "fetch('http://127.0.0.1:' + (process.env.SUB_STORE_BACKEND_API_PORT || '3000') + '/api/utils/env').then((response) => { if (!response.ok) throw new Error('HTTP ' + response.status); }).catch((error) => { console.error(error); process.exit(1); })"]
+    CMD ["node", "-e", "const pathPrefix = process.env.SUB_STORE_BACKEND_PREFIX ? (process.env.SUB_STORE_FRONTEND_BACKEND_PATH || '').replace(/\\/$/, '') : ''; fetch('http://127.0.0.1:' + (process.env.SUB_STORE_BACKEND_API_PORT || '3000') + pathPrefix + '/api/utils/env').then((response) => { if (!response.ok) throw new Error('HTTP ' + response.status); }).catch((error) => { console.error(error); process.exit(1); })"]
 
 CMD ["node", "/app/sub-store.bundle.js"]

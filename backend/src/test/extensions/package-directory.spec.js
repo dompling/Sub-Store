@@ -1,31 +1,27 @@
 import { expect } from 'chai';
 import { describe, it } from 'mocha';
-import { CONFIG_GENERATOR_KEY } from '@/constants';
 import { createLocalOfficialPackage } from '@/extensions/catalog.generated';
-import { EXTENSION_IDS } from '@/extensions/contracts';
-import { initializeExtensionHost } from '@/extensions/host';
 import {
-    ExtensionManager,
-    resetExtensionManagerForTests,
-} from '@/extensions/manager';
+    EXTENSION_IDS,
+    canonicalJson,
+    normalizeExtensionManifest,
+} from '@/extensions/contracts';
+import { ExtensionManager } from '@/extensions/manager';
 import {
     EXTENSION_DIRECTORY_FORMAT,
     EXTENSION_DIRECTORY_MIME,
     normalizeExtensionPackageDirectory,
 } from '@/extensions/package-directory';
 import { createNodeExtensionPackageStore } from '@/extensions/package-store';
-import {
-    clearExtensionRegistryForTests,
-    getArtifactSourceAdapter,
-    registerExtensionRoutes,
-} from '@/extensions/registry';
 import { registerExtensionControlRoutes } from '@/restful/extensions';
-import express from '@/vendor/express';
+import {
+    createDigestReceipt,
+    extensionPackageDigest,
+    sha256Hex,
+} from '@/extensions/signature';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-
-const TEST_HOST = '127.0.0.1';
 
 function directoryProjection(packageInput) {
     const { payload } = packageInput;
@@ -53,6 +49,84 @@ function directoryProjection(packageInput) {
                 2,
             ),
             ...payload.files,
+        },
+    };
+}
+
+function localExecutablePackage() {
+    const extensionId = 'org.example.local-executable';
+    const implementationAbi = 'local-executable@1';
+    const manifest = normalizeExtensionManifest({
+        schemaVersion: 1,
+        id: extensionId,
+        kind: 'executable',
+        distribution: 'store',
+        name: 'Local executable',
+        version: '1.0.0',
+        publisher: { id: 'org.example', name: 'Example publisher' },
+        host: { apiVersion: '1.0.0', runtimes: ['node'] },
+        variants: {
+            node: {
+                implementationId: `${extensionId}@1/node`,
+                implementationAbi,
+                entrypoint: 'backend/index.cjs',
+                containsExecutableCode: true,
+            },
+        },
+    });
+    const files = {
+        'backend/index.cjs': `'use strict';
+module.exports = Object.freeze({
+    extensionId: '${extensionId}',
+    implementationAbi: '${implementationAbi}',
+    activate() { return { active: true }; },
+    deactivate() { return { active: false }; },
+});
+`,
+    };
+    const fileDigests = Object.fromEntries(
+        Object.entries(files).map(([name, content]) => [
+            name,
+            sha256Hex(content),
+        ]),
+    );
+    const projection = {
+        schemaVersion: 1,
+        manifest,
+        selectedVariant: 'node',
+        variant: manifest.variants.node,
+        containsExecutableCode: true,
+        containsInstallHook: false,
+        files,
+        fileDigests,
+    };
+    const packageDigest = extensionPackageDigest(projection);
+    const receipt = createDigestReceipt({
+        manifest,
+        packageDigest,
+        variant: 'node',
+        implementation: {
+            id: manifest.variants.node.implementationId,
+            abi: implementationAbi,
+            entrypoint: 'backend/index.cjs',
+            lanes: {},
+            containsExecutableCode: true,
+        },
+    });
+    const payload = { ...projection, packageDigest, receipt };
+    const payloadDigest = sha256Hex(canonicalJson(payload));
+    return {
+        schemaVersion: 1,
+        source: 'local-upload',
+        manifest,
+        selectedVariant: 'node',
+        payload,
+        receipt,
+        packageDigest,
+        signature: {
+            algorithm: 'sha256-digest',
+            digest: payloadDigest,
+            value: payloadDigest,
         },
     };
 }
@@ -148,27 +222,6 @@ function createResponse() {
             this.ended = true;
         },
     };
-}
-
-function waitForListening(server) {
-    if (server?.listening) return Promise.resolve();
-    return new Promise((resolve, reject) => {
-        server.once('listening', resolve);
-        server.once('error', reject);
-    });
-}
-
-function closeServer(server) {
-    return new Promise((resolve, reject) => {
-        server.close((error) => {
-            if (error) reject(error);
-            else resolve();
-        });
-        // Node's fetch implementation keeps pooled HTTP connections alive.
-        // Close them explicitly so the lifecycle test cannot hang after all
-        // assertions have completed.
-        server.closeAllConnections?.();
-    });
 }
 
 describe('Extension package directory', function () {
@@ -413,6 +466,79 @@ describe('Extension package directory', function () {
         }
     });
 
+    it('treats an explicitly uploaded executable directory as integrity-trusted across restart', async function () {
+        const basePath = fs.mkdtempSync(
+            path.join(os.tmpdir(), 'sub-store-local-executable-'),
+        );
+        try {
+            const store = createStore(undefined);
+            const packageStore = createNodeExtensionPackageStore({ basePath });
+            const manager = new ExtensionManager({
+                store,
+                env: { isNode: true },
+                packageStore,
+            });
+            const { app, handlers } = createRouteApp();
+            registerExtensionControlRoutes(app, manager);
+            const packageInput = localExecutablePackage();
+            const projection = directoryProjection(packageInput);
+
+            const inspectResponse = createResponse();
+            await handlers.get('POST /api/admin/extensions/packages/inspect')(
+                {
+                    body: projection,
+                    headers: { 'content-type': EXTENSION_DIRECTORY_MIME },
+                    extensionAdmin: true,
+                },
+                inspectResponse,
+            );
+            expect(inspectResponse.statusCode).to.equal(200);
+            expect(inspectResponse.body.data).to.include({
+                extensionId: packageInput.manifest.id,
+                verificationMode: 'local-integrity',
+            });
+
+            const installResponse = createResponse();
+            await handlers.get('POST /api/admin/extensions/:id/install-local')(
+                {
+                    params: { id: packageInput.manifest.id },
+                    body: projection,
+                    headers: { 'content-type': EXTENSION_DIRECTORY_MIME },
+                    extensionAdmin: true,
+                },
+                installResponse,
+            );
+            expect(installResponse.statusCode).to.equal(201);
+            expect(installResponse.body.data.record).to.include({
+                distribution: 'local-executable',
+                verificationMode: 'local-integrity',
+            });
+            manager.enable(packageInput.manifest.id);
+            expect(manager.getHealth(packageInput.manifest.id).status).to.equal(
+                'healthy',
+            );
+
+            const restarted = new ExtensionManager({
+                store,
+                env: { isNode: true },
+                packageStore,
+            });
+            const restored = restarted.restoreEnabledExtensions();
+            expect(restored).to.have.length(1);
+            expect(restored[0]).to.include({
+                extensionId: packageInput.manifest.id,
+                status: 'enabled',
+            });
+            expect(
+                restarted.getHealth(packageInput.manifest.id).status,
+            ).to.equal('healthy');
+            restarted.disable(packageInput.manifest.id);
+            restarted.uninstall(packageInput.manifest.id);
+        } finally {
+            fs.rmSync(basePath, { recursive: true, force: true });
+        }
+    });
+
     it('protects local package routes by admin, MIME, runtime and route identity', async function () {
         const nodeManager = new ExtensionManager({
             store: createStore(undefined),
@@ -525,282 +651,5 @@ describe('Extension package directory', function () {
         expect(unsupported.body.error.code).to.equal(
             'EXTENSION_LOCAL_PACKAGE_UNSUPPORTED',
         );
-    });
-
-    it('ships a browser-selectable config-generator directory that verifies exactly', async function () {
-        const root = path.resolve(
-            process.cwd(),
-            'src/test/fixtures/extensions/packages/org.substore.config-generator',
-        );
-        const packageMetadataText = fs.readFileSync(
-            path.join(root, 'package.json'),
-            'utf8',
-        );
-        const packageMetadata = JSON.parse(packageMetadataText);
-        const projection = {
-            schemaVersion: 1,
-            format: EXTENSION_DIRECTORY_FORMAT,
-            files: {
-                'manifest.json': fs.readFileSync(
-                    path.join(root, 'manifest.json'),
-                    'utf8',
-                ),
-                'receipt.json': fs.readFileSync(
-                    path.join(root, 'receipt.json'),
-                    'utf8',
-                ),
-                'package.json': packageMetadataText,
-                ...Object.fromEntries(
-                    Object.keys(packageMetadata.fileDigests).map((name) => [
-                        name,
-                        fs.readFileSync(path.join(root, name), 'utf8'),
-                    ]),
-                ),
-            },
-        };
-        const normalized = normalizeExtensionPackageDirectory(projection, {
-            expectedExtensionId: EXTENSION_IDS.configGenerator,
-        });
-        expect(normalized.packageInput.packageDigest).to.equal(
-            packageMetadata.packageDigest,
-        );
-        const basePath = fs.mkdtempSync(
-            path.join(os.tmpdir(), 'sub-store-config-generator-directory-'),
-        );
-        const retainedData = {
-            version: 1,
-            projects: [{ name: 'folder-project', rules: [] }],
-            ruleSets: [{ name: 'folder-rules', rules: [] }],
-        };
-        let server;
-        try {
-            resetExtensionManagerForTests();
-            clearExtensionRegistryForTests();
-            const store = createKeyStore({
-                [CONFIG_GENERATOR_KEY]: retainedData,
-            });
-            const packageStore = createNodeExtensionPackageStore({ basePath });
-            const host = initializeExtensionHost({
-                reset: true,
-                store,
-                env: { isNode: true },
-                packageStore,
-                adoptLegacy: false,
-                restoreEnabled: false,
-            });
-            expect(
-                host.manager.inspectLocalPackage(normalized.packageInput),
-            ).to.include({
-                extensionId: EXTENSION_IDS.configGenerator,
-                selectedVariant: 'node',
-                verificationMode: 'trusted-signature',
-            });
-
-            // Match the real Node startup order: mount the extension surface,
-            // then broader download and terminal GET routes, and only then
-            // install the package while the listener is already running.
-            const app = express({
-                substore: { info() {} },
-                port: 0,
-                host: TEST_HOST,
-            });
-            registerExtensionRoutes(app, {
-                extensionManager: host.manager,
-                produceBuiltinArtifact: async () => '',
-            });
-            app.get('/download/:name/:target', (req, res) =>
-                res.status(418).json({ source: 'generic-download' }),
-            );
-            server = app.start();
-            await waitForListening(server);
-            const baseUrl = `http://${TEST_HOST}:${server.address().port}`;
-
-            const beforeInstall = await fetch(
-                `${baseUrl}/api/extensions/config-generator/projects`,
-            );
-            expect(beforeInstall.status).to.equal(404);
-
-            const controlRoutes = createRouteApp();
-            registerExtensionControlRoutes(controlRoutes.app, host.manager);
-            const installLocal = controlRoutes.handlers.get(
-                'POST /api/admin/extensions/:id/install-local',
-            );
-            const installResponse = createResponse();
-            await installLocal(
-                {
-                    params: { id: EXTENSION_IDS.configGenerator },
-                    body: projection,
-                    headers: {
-                        'content-type': EXTENSION_DIRECTORY_MIME,
-                        'x-idempotency-key': 'folder-install',
-                    },
-                    extensionAdmin: true,
-                },
-                installResponse,
-            );
-            expect(installResponse.statusCode).to.equal(201);
-            expect(installResponse.body.data.status).to.equal(
-                'installed-disabled',
-            );
-
-            host.manager.enable(EXTENSION_IDS.configGenerator, {
-                idempotencyKey: 'folder-enable',
-            });
-            expect(
-                host.manager.getHealth(EXTENSION_IDS.configGenerator).status,
-            ).to.equal('healthy');
-
-            const projectsResponse = await fetch(
-                `${baseUrl}/api/extensions/config-generator/projects`,
-            );
-            expect(projectsResponse.status).to.equal(200);
-            expect((await projectsResponse.json()).data).to.deep.equal(
-                retainedData.projects,
-            );
-            for (const downloadPath of [
-                '/download/config-project/missing-project',
-                '/download/config-project/missing-project/QX',
-                '/download/config-project/missing-project/proxy-source/nodes/QX',
-            ]) {
-                const response = await fetch(`${baseUrl}${downloadPath}`);
-                expect(response.status).to.equal(404);
-                expect((await response.json()).error.code).to.equal(
-                    'CONFIG_GENERATOR_PROJECT_NOT_FOUND',
-                );
-            }
-            expect(
-                getArtifactSourceAdapter('config-project').list(),
-            ).to.deep.equal([
-                { name: 'folder-project', displayName: 'folder-project' },
-            ]);
-
-            const assetRoute = controlRoutes.handlers.get(
-                'GET /api/extensions/:id/assets/*',
-            );
-            const assetResponse = createResponse();
-            await assetRoute(
-                {
-                    params: {
-                        id: EXTENSION_IDS.configGenerator,
-                        0: 'frontend/index.js',
-                    },
-                    headers: {},
-                },
-                assetResponse,
-            );
-            expect(assetResponse.statusCode).to.equal(200);
-            expect(assetResponse.body).to.equal(
-                projection.files['frontend/index.js'],
-            );
-            expect(assetResponse.headers).to.include({
-                'X-Sub-Store-Asset-Digest':
-                    packageMetadata.fileDigests['frontend/index.js'],
-                'X-Content-Type-Options': 'nosniff',
-            });
-
-            const installedDirectory = host.manager.getRecord(
-                EXTENSION_IDS.configGenerator,
-            ).packageDirectory;
-            host.manager.disable(EXTENSION_IDS.configGenerator, {
-                idempotencyKey: 'folder-disable',
-            });
-            const disabledProjects = await fetch(
-                `${baseUrl}/api/extensions/config-generator/projects`,
-            );
-            expect(disabledProjects.status).to.equal(409);
-            expect((await disabledProjects.json()).error.code).to.equal(
-                'EXTENSION_DISABLED',
-            );
-            const disabledAssetResponse = createResponse();
-            await assetRoute(
-                {
-                    params: {
-                        id: EXTENSION_IDS.configGenerator,
-                        0: 'frontend/index.js',
-                    },
-                    headers: {},
-                },
-                disabledAssetResponse,
-            );
-            expect(disabledAssetResponse.statusCode).to.equal(409);
-            expect(disabledAssetResponse.body.error.code).to.equal(
-                'EXTENSION_DISABLED',
-            );
-
-            host.manager.enable(EXTENSION_IDS.configGenerator, {
-                idempotencyKey: 'folder-runtime-reenable',
-            });
-            const reenabledProjects = await fetch(
-                `${baseUrl}/api/extensions/config-generator/projects`,
-            );
-            expect(reenabledProjects.status).to.equal(200);
-            expect((await reenabledProjects.json()).data).to.deep.equal(
-                retainedData.projects,
-            );
-
-            host.manager.uninstall(EXTENSION_IDS.configGenerator, {
-                idempotencyKey: 'folder-uninstall',
-            });
-            expect(fs.existsSync(installedDirectory)).to.equal(false);
-            expect(store.read(CONFIG_GENERATOR_KEY)).to.deep.equal(
-                retainedData,
-            );
-            const uninstalledProjects = await fetch(
-                `${baseUrl}/api/extensions/config-generator/projects`,
-            );
-            expect(uninstalledProjects.status).to.equal(409);
-            expect((await uninstalledProjects.json()).error.code).to.equal(
-                'EXTENSION_REINSTALL_REQUIRED',
-            );
-
-            const reinstallResponse = createResponse();
-            await installLocal(
-                {
-                    params: { id: EXTENSION_IDS.configGenerator },
-                    body: projection,
-                    headers: {
-                        'content-type': EXTENSION_DIRECTORY_MIME,
-                        'x-idempotency-key': 'folder-reinstall',
-                    },
-                    extensionAdmin: true,
-                },
-                reinstallResponse,
-            );
-            expect(reinstallResponse.statusCode).to.equal(201);
-            host.manager.enable(EXTENSION_IDS.configGenerator, {
-                idempotencyKey: 'folder-reenable',
-            });
-
-            const reloadedProjectsResponse = await fetch(
-                `${baseUrl}/api/extensions/config-generator/projects`,
-            );
-            expect(reloadedProjectsResponse.status).to.equal(200);
-            expect((await reloadedProjectsResponse.json()).data).to.deep.equal(
-                retainedData.projects,
-            );
-            const reloadedAssetResponse = createResponse();
-            await assetRoute(
-                {
-                    params: {
-                        id: EXTENSION_IDS.configGenerator,
-                        0: 'frontend/index.js',
-                    },
-                    headers: {},
-                },
-                reloadedAssetResponse,
-            );
-            expect(reloadedAssetResponse.statusCode).to.equal(200);
-            expect(store.read(CONFIG_GENERATOR_KEY)).to.deep.equal(
-                retainedData,
-            );
-
-            host.manager.disable(EXTENSION_IDS.configGenerator);
-            host.manager.uninstall(EXTENSION_IDS.configGenerator);
-        } finally {
-            if (server?.listening) await closeServer(server);
-            clearExtensionRegistryForTests();
-            resetExtensionManagerForTests();
-            fs.rmSync(basePath, { recursive: true, force: true });
-        }
     });
 });

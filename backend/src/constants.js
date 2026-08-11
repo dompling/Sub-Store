@@ -5,7 +5,6 @@ export const COLLECTIONS_KEY = 'collections';
 export const FILES_KEY = 'files';
 export const MODULES_KEY = 'modules';
 export const ARTIFACTS_KEY = 'artifacts';
-export const CONFIG_GENERATOR_KEY = 'configGenerator';
 // Extension Host state lives in the root/global store so that Node and
 // script-product invocations share lifecycle revisions and receipts. Global
 // metadata is indexed separately from extension-owned lifecycle records so a

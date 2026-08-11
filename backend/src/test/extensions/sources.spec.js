@@ -1,7 +1,6 @@
 import { expect } from 'chai';
 import { describe, it } from 'mocha';
 import {
-    EXTENSION_IDS,
     canonicalJson,
     normalizeExtensionManifest,
 } from '@/extensions/contracts';
@@ -25,11 +24,14 @@ import {
 } from '@/extensions/sources';
 import { createNodeExtensionPackageStore } from '@/extensions/package-store';
 import { clearExtensionRegistryForTests } from '@/extensions/registry';
+import { registerExtensionControlRoutes } from '@/restful/extensions';
 import dns from 'dns';
-import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+
+const EXECUTABLE_EXTENSION_ID = 'org.example.executable-extension';
+const EXECUTABLE_SOURCE_URL = 'https://example.test/extensions/catalog.json';
 
 function createStore(initial) {
     const values =
@@ -62,30 +64,42 @@ function response(value) {
     };
 }
 
-function staticConfigGeneratorRepository() {
-    const repositoryRoot = path.resolve(
-        process.cwd(),
-        'src/test/fixtures/extensions/repository',
-    );
-    const catalog = JSON.parse(
-        fs.readFileSync(path.join(repositoryRoot, 'catalog.json'), 'utf8'),
-    );
-    const sourceUrl =
-        'https://raw.githubusercontent.com/dompling/Sub-Store-Extensions/main/repository/catalog.json';
-    const packageUrl = new URL(
-        catalog.entries[0].packageUrl,
-        sourceUrl,
-    ).toString();
-    const packageDocument = JSON.parse(
-        fs.readFileSync(
-            path.join(
-                repositoryRoot,
-                catalog.entries[0].packageUrl.replace(/^\.\//, ''),
-            ),
-            'utf8',
-        ),
-    );
-    return { catalog, packageDocument, packageUrl, sourceUrl };
+function createRouteApp() {
+    const handlers = new Map();
+    const app = {};
+    for (const method of ['get', 'post', 'put', 'patch', 'delete']) {
+        app[method] = (route, ...routeHandlers) => {
+            handlers.set(
+                `${method.toUpperCase()} ${route}`,
+                routeHandlers[routeHandlers.length - 1],
+            );
+            return app;
+        };
+    }
+    return { app, handlers };
+}
+
+function createApiResponse() {
+    return {
+        statusCode: 200,
+        body: null,
+        headers: {},
+        status(code) {
+            this.statusCode = code;
+            return this;
+        },
+        set(key, value) {
+            this.headers[key] = value;
+            return this;
+        },
+        json(body) {
+            this.body = body;
+            return this;
+        },
+        end() {
+            this.ended = true;
+        },
+    };
 }
 
 function contentFixture({
@@ -170,78 +184,138 @@ function clone(value) {
     return JSON.parse(JSON.stringify(value));
 }
 
-function signedConfigGeneratorRelease(
-    repository,
-    {
+function executableRelease({
+    version = '1.1.0',
+    packageUrl = `https://example.test/extensions/executable-${version}.json`,
+    backendEntrypoint,
+} = {}) {
+    const implementationAbi = 'example-executable@1';
+    // Keep the package manifest in its authored form. Source ingestion adds
+    // optional normalized defaults (permissions/contributes/lanes), and the
+    // Host must compare those forms semantically without changing the bytes
+    // covered by the package and receipt digests.
+    const manifest = {
+        schemaVersion: 1,
+        id: EXECUTABLE_EXTENSION_ID,
+        kind: 'executable',
+        distribution: 'store',
+        name: 'Example executable extension',
+        description: 'Synthetic executable package used by Host tests',
         version,
-        keyId,
-        privateKey,
-        packageUrl = `https://example.test/config-generator-${version}.json`,
-        backendEntrypoint,
-    },
-) {
-    const packageDocument = clone(repository.packageDocument);
-    const manifest = normalizeExtensionManifest({
-        ...packageDocument.manifest,
-        version,
-        frontend: {
-            ...packageDocument.manifest.frontend,
-            embeddedBasePath: `extensions/${EXTENSION_IDS.configGenerator}/${version}`,
+        publisher: { id: 'org.example', name: 'Example publisher' },
+        host: {
+            apiVersion: '1.0.0',
+            runtimes: ['node'],
+            implementationAbi,
         },
-    });
-    const payload = packageDocument.payload;
-    payload.manifest = clone(manifest);
-    payload.variant = clone(manifest.variants.node);
-    if (backendEntrypoint) {
-        payload.files['backend/index.cjs'] = backendEntrypoint;
-    }
-    payload.fileDigests = Object.fromEntries(
-        Object.entries(payload.files).map(([name, content]) => [
+        variants: {
+            node: {
+                implementationId: `${EXECUTABLE_EXTENSION_ID}@1/node`,
+                implementationAbi,
+                entrypoint: 'backend/index.cjs',
+                containsExecutableCode: true,
+            },
+        },
+        scriptExecutionLanes: {
+            simple: {
+                product: 'sub-store-0',
+                implementationId: `${EXECUTABLE_EXTENSION_ID}@1/simple`,
+                routes: ['status'],
+            },
+        },
+    };
+    const files = {
+        'backend/index.cjs':
+            backendEntrypoint ||
+            `'use strict';
+module.exports = Object.freeze({
+    extensionId: '${EXECUTABLE_EXTENSION_ID}',
+    implementationAbi: '${implementationAbi}',
+    activate() { return { active: true }; },
+    deactivate() { return { active: false }; },
+});
+`,
+    };
+    const fileDigests = Object.fromEntries(
+        Object.entries(files).map(([name, content]) => [
             name,
             sha256Hex(content),
         ]),
     );
-    const packageDigest = extensionPackageDigest(payload);
+    const projection = {
+        schemaVersion: 1,
+        manifest,
+        selectedVariant: 'node',
+        variant: manifest.variants.node,
+        containsExecutableCode: true,
+        containsInstallHook: false,
+        files,
+        fileDigests,
+    };
+    const packageDigest = extensionPackageDigest(projection);
     const receipt = createDigestReceipt({
         manifest,
         packageDigest,
         variant: 'node',
-        implementation: clone(
-            repository.packageDocument.receipt.implementation,
-        ),
+        implementation: {
+            id: manifest.variants.node.implementationId,
+            abi: implementationAbi,
+            entrypoint: 'backend/index.cjs',
+            lanes: {
+                simple: {
+                    product: 'sub-store-0',
+                    implementationId: `${EXECUTABLE_EXTENSION_ID}@1/simple`,
+                },
+            },
+            containsExecutableCode: true,
+        },
         now: Date.parse('2026-08-11T00:00:00.000Z'),
     });
-    payload.packageDigest = packageDigest;
-    payload.receipt = clone(receipt);
-    const serializedPayload = canonicalJson(payload);
-    const payloadDigest = sha256Hex(serializedPayload);
-    packageDocument.manifest = clone(manifest);
-    packageDocument.packageDigest = packageDigest;
-    packageDocument.receipt = clone(receipt);
-    packageDocument.signature = {
-        algorithm: 'ed25519',
-        keyId,
-        digest: payloadDigest,
-        value: crypto
-            .sign(null, Buffer.from(serializedPayload), privateKey)
-            .toString('base64'),
+    const payload = { ...projection, packageDigest, receipt };
+    const payloadDigest = sha256Hex(canonicalJson(payload));
+    const packageDocument = {
+        schemaVersion: 1,
+        source: 'org.example.extensions',
+        manifest,
+        selectedVariant: 'node',
+        payload,
+        receipt,
+        packageDigest,
+        signature: {
+            algorithm: 'sha256-digest',
+            digest: payloadDigest,
+            value: payloadDigest,
+        },
     };
-
-    const catalog = clone(repository.catalog);
-    const entry = catalog.entries[0];
-    Object.assign(entry, {
-        id: manifest.id,
-        version: manifest.version,
-        name: manifest.name,
-        description: manifest.description,
-        kind: manifest.kind,
-        manifest: clone(manifest),
+    const catalog = {
+        schemaVersion: 1,
+        id: 'org.example.extensions',
+        name: 'Example Extensions',
+        sequence: 1,
+        publisher: { id: 'org.example', name: 'Example publisher' },
+        entries: [
+            {
+                id: manifest.id,
+                version: manifest.version,
+                name: manifest.name,
+                description: manifest.description,
+                kind: manifest.kind,
+                sourceName: 'Example Extensions',
+                manifest,
+                packageUrl,
+                packageDigest,
+                packageUrls: { node: packageUrl },
+                packageDigests: { node: packageDigest },
+            },
+        ],
+    };
+    return {
+        catalog,
+        packageDocument,
         packageUrl,
         packageDigest,
-        packageUrls: { node: packageUrl },
-        packageDigests: { node: packageDigest },
-    });
-    return { catalog, packageDocument, packageUrl };
+        sourceUrl: EXECUTABLE_SOURCE_URL,
+    };
 }
 
 function resealCommunityPackage(document) {
@@ -744,10 +818,10 @@ describe('Community extension sources', function () {
         );
     });
 
-    it('installs the signed config-generator mirror through its complete lifecycle', async function () {
-        const repository = staticConfigGeneratorRepository();
+    it('installs a digest executable only after its source is added and keeps it verifiable', async function () {
+        const repository = executableRelease();
         const basePath = fs.mkdtempSync(
-            path.join(os.tmpdir(), 'sub-store-official-mirror-'),
+            path.join(os.tmpdir(), 'sub-store-source-executable-'),
         );
         try {
             resetExtensionManagerForTests();
@@ -768,18 +842,38 @@ describe('Community extension sources', function () {
             });
             const manager = host.manager;
 
+            expect(
+                manager.getCatalog().entries.map((entry) => entry.id),
+            ).to.not.include(EXECUTABLE_EXTENSION_ID);
+            expect(
+                manager
+                    .getRuntimeManifest()
+                    .extensions.map((entry) => entry.id),
+            ).to.not.include(EXECUTABLE_EXTENSION_ID);
+            expect(manager.findEntry(EXECUTABLE_EXTENSION_ID)).to.equal(null);
+
+            let missingSourceError;
+            try {
+                await manager.installFromSource(EXECUTABLE_EXTENSION_ID);
+            } catch (error) {
+                missingSourceError = error;
+            }
+            expect(missingSourceError).to.include({
+                code: 'EXTENSION_SOURCE_NOT_FOUND',
+            });
+
             const source = await manager.addSource({
                 url: repository.sourceUrl,
-                name: 'GitHub official mirror',
+                name: 'Example source',
             });
             expect(source.publisher).to.deep.equal({
-                id: 'org.substore',
-                name: 'Sub-Store',
+                id: 'org.example',
+                name: 'Example publisher',
             });
             expect(source.entries).to.have.length(1);
             expect(source.entries[0]).to.include({
-                id: EXTENSION_IDS.configGenerator,
-                distribution: 'trusted-official-mirror',
+                id: EXECUTABLE_EXTENSION_ID,
+                distribution: 'source-executable',
                 source: repository.sourceUrl,
             });
             expect(source.entries[0].packageUrls.node).to.equal(
@@ -788,67 +882,75 @@ describe('Community extension sources', function () {
 
             const catalogEntry = manager
                 .getCatalog()
-                .entries.find(
-                    (entry) => entry.id === EXTENSION_IDS.configGenerator,
-                );
+                .entries.find((entry) => entry.id === EXECUTABLE_EXTENSION_ID);
             expect(catalogEntry).to.include({
                 sourceId: source.id,
-                sourceName: 'Sub-Store Extensions',
+                sourceName: 'Example Extensions',
                 sourceUrl: repository.sourceUrl,
+                distribution: 'source-executable',
             });
             expect(catalogEntry.packageUrls.node).to.equal(
                 repository.packageUrl,
             );
-            expect(manager.findEntry(EXTENSION_IDS.configGenerator)).to.include(
-                { remotePackage: true, sourceId: source.id },
-            );
+            expect(manager.findEntry(EXECUTABLE_EXTENSION_ID)).to.include({
+                distribution: 'source-executable',
+                sourceId: source.id,
+            });
 
-            const installed = await manager.installFromSource(
-                EXTENSION_IDS.configGenerator,
+            const { app, handlers } = createRouteApp();
+            registerExtensionControlRoutes(app, manager);
+            const installResponse = createApiResponse();
+            await handlers.get('POST /api/admin/extensions/:id/install')(
+                {
+                    params: { id: EXECUTABLE_EXTENSION_ID },
+                    body: {},
+                    headers: {},
+                    extensionAdmin: true,
+                },
+                installResponse,
             );
+            expect(installResponse.statusCode).to.equal(201);
+            const installed = installResponse.body.data;
             expect(installed.record).to.include({
-                extensionId: EXTENSION_IDS.configGenerator,
-                verificationMode: 'trusted-signature',
+                extensionId: EXECUTABLE_EXTENSION_ID,
+                verificationMode: 'source-integrity',
                 sourceId: source.id,
                 sourceUrl: repository.sourceUrl,
                 codeStatus: 'verified-package-installed',
             });
             expect(
-                manager.getRecord(EXTENSION_IDS.configGenerator)
-                    .packageDirectory,
+                manager.getRecord(EXECUTABLE_EXTENSION_ID).packageDirectory,
             ).to.be.a('string');
 
+            expect(manager.enable(EXECUTABLE_EXTENSION_ID).status).to.equal(
+                'enabled',
+            );
+            expect(manager.getHealth(EXECUTABLE_EXTENSION_ID).status).to.equal(
+                'healthy',
+            );
+            expect(manager.disable(EXECUTABLE_EXTENSION_ID).status).to.equal(
+                'disabled',
+            );
             expect(
-                manager.enable(EXTENSION_IDS.configGenerator).status,
-            ).to.equal('enabled');
-            expect(
-                manager.getHealth(EXTENSION_IDS.configGenerator).status,
-            ).to.equal('healthy');
-            expect(
-                manager.disable(EXTENSION_IDS.configGenerator).status,
-            ).to.equal('disabled');
-            expect(
-                manager.getAvailability(EXTENSION_IDS.configGenerator).status,
+                manager.getAvailability(EXECUTABLE_EXTENSION_ID).status,
             ).to.equal('disabled');
 
-            const uninstalled = manager.uninstall(
-                EXTENSION_IDS.configGenerator,
-            );
+            const uninstalled = manager.uninstall(EXECUTABLE_EXTENSION_ID);
             expect(uninstalled.status).to.equal('reinstall-required');
             expect(uninstalled.record.codeStatus).to.equal('removed');
 
             const reinstalled = await manager.installFromSource(
-                EXTENSION_IDS.configGenerator,
+                EXECUTABLE_EXTENSION_ID,
             );
             expect(reinstalled.status).to.equal('installed-disabled');
-            expect(
-                manager.enable(EXTENSION_IDS.configGenerator).status,
-            ).to.equal('enabled');
-            expect(
-                manager.getHealth(EXTENSION_IDS.configGenerator).status,
-            ).to.equal('healthy');
-            manager.disable(EXTENSION_IDS.configGenerator);
-            manager.uninstall(EXTENSION_IDS.configGenerator);
+            expect(manager.enable(EXECUTABLE_EXTENSION_ID).status).to.equal(
+                'enabled',
+            );
+            expect(manager.getHealth(EXECUTABLE_EXTENSION_ID).status).to.equal(
+                'healthy',
+            );
+            manager.disable(EXECUTABLE_EXTENSION_ID);
+            manager.uninstall(EXECUTABLE_EXTENSION_ID);
         } finally {
             clearExtensionRegistryForTests();
             resetExtensionManagerForTests();
@@ -856,23 +958,17 @@ describe('Community extension sources', function () {
         }
     });
 
-    it('updates an enabled signed extension, preserves data, rolls back, and restores after activation failure', async function () {
-        const repository = staticConfigGeneratorRepository();
-        const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
-        const testKeyId = 'config-generator-update-test-key';
-        const v2 = signedConfigGeneratorRelease(repository, {
+    it('updates an enabled digest executable, rolls back, and restores after activation failure', async function () {
+        const repository = executableRelease();
+        const v2 = executableRelease({
             version: '1.2.0',
-            keyId: testKeyId,
-            privateKey,
         });
-        const v3 = signedConfigGeneratorRelease(repository, {
+        const v3 = executableRelease({
             version: '1.3.0',
-            keyId: testKeyId,
-            privateKey,
             backendEntrypoint: `'use strict';
 module.exports = Object.freeze({
-    extensionId: '${EXTENSION_IDS.configGenerator}',
-    implementationAbi: 'config-generator@1',
+    extensionId: '${EXECUTABLE_EXTENSION_ID}',
+    implementationAbi: 'example-executable@1',
     activate() {
         const error = new Error('simulated activation failure');
         error.code = 'TEST_EXTENSION_ACTIVATION_FAILED';
@@ -889,7 +985,7 @@ module.exports = Object.freeze({
         const preservedProjects = [
             { name: 'Keep me', target: 'Surge', rules: [] },
         ];
-        store.write(preservedProjects, 'configGenerator');
+        store.write(preservedProjects, 'externalExtensionData');
         let activeCatalog = repository.catalog;
         const packages = new Map([
             [repository.packageUrl, repository.packageDocument],
@@ -910,18 +1006,6 @@ module.exports = Object.freeze({
                             ? activeCatalog
                             : packages.get(url),
                     ),
-                trustedKeys: {
-                    [testKeyId]: publicKey.export({
-                        type: 'spki',
-                        format: 'pem',
-                    }),
-                },
-                trustedOfficialKeyIds: {
-                    [EXTENSION_IDS.configGenerator]: [
-                        repository.packageDocument.signature.keyId,
-                        testKeyId,
-                    ],
-                },
                 adoptLegacy: false,
                 restoreEnabled: false,
             });
@@ -929,11 +1013,11 @@ module.exports = Object.freeze({
             const source = await manager.addSource({
                 url: repository.sourceUrl,
             });
-            await manager.installFromSource(EXTENSION_IDS.configGenerator);
-            manager.enable(EXTENSION_IDS.configGenerator);
+            await manager.installFromSource(EXECUTABLE_EXTENSION_ID);
+            manager.enable(EXECUTABLE_EXTENSION_ID);
 
             activeCatalog = v2.catalog;
-            const updated = await manager.update(EXTENSION_IDS.configGenerator);
+            const updated = await manager.update(EXECUTABLE_EXTENSION_ID);
             expect(updated.status).to.equal('updated-enabled');
             expect(updated.record).to.include({
                 version: '1.2.0',
@@ -941,17 +1025,17 @@ module.exports = Object.freeze({
                 rollbackAvailable: true,
             });
             expect(updated.record.rollbackVersions).to.deep.equal(['1.1.0']);
-            expect(
-                manager.getHealth(EXTENSION_IDS.configGenerator).status,
-            ).to.equal('healthy');
-            expect(store.read('configGenerator')).to.deep.equal(
+            expect(manager.getHealth(EXECUTABLE_EXTENSION_ID).status).to.equal(
+                'healthy',
+            );
+            expect(store.read('externalExtensionData')).to.deep.equal(
                 preservedProjects,
             );
             expect(
                 manager
                     .getCatalog()
                     .entries.find(
-                        (entry) => entry.id === EXTENSION_IDS.configGenerator,
+                        (entry) => entry.id === EXECUTABLE_EXTENSION_ID,
                     ),
             ).to.include({
                 installedVersion: '1.2.0',
@@ -960,18 +1044,25 @@ module.exports = Object.freeze({
                 rollbackAvailable: true,
             });
 
+            const current = await manager.update(EXECUTABLE_EXTENSION_ID);
+            expect(current).to.include({ status: 'current', noOp: true });
+            expect(current.record).to.include({
+                version: '1.2.0',
+                enabled: true,
+            });
+
             manager.removeSource(source.id);
-            const rolledBack = manager.rollback(EXTENSION_IDS.configGenerator);
+            const rolledBack = manager.rollback(EXECUTABLE_EXTENSION_ID);
             expect(rolledBack.status).to.equal('rolled-back-enabled');
             expect(rolledBack.record).to.include({
                 version: '1.1.0',
                 enabled: true,
                 rollbackAvailable: false,
             });
-            expect(
-                manager.getHealth(EXTENSION_IDS.configGenerator).status,
-            ).to.equal('healthy');
-            expect(store.read('configGenerator')).to.deep.equal(
+            expect(manager.getHealth(EXECUTABLE_EXTENSION_ID).status).to.equal(
+                'healthy',
+            );
+            expect(store.read('externalExtensionData')).to.deep.equal(
                 preservedProjects,
             );
             await manager.addSource({ url: repository.sourceUrl });
@@ -979,7 +1070,7 @@ module.exports = Object.freeze({
                 manager
                     .getCatalog()
                     .entries.find(
-                        (entry) => entry.id === EXTENSION_IDS.configGenerator,
+                        (entry) => entry.id === EXECUTABLE_EXTENSION_ID,
                     ),
             ).to.include({
                 installedVersion: '1.1.0',
@@ -990,7 +1081,7 @@ module.exports = Object.freeze({
             activeCatalog = v3.catalog;
             let activationError;
             try {
-                await manager.update(EXTENSION_IDS.configGenerator);
+                await manager.update(EXECUTABLE_EXTENSION_ID);
             } catch (error) {
                 activationError = error;
             }
@@ -1003,13 +1094,14 @@ module.exports = Object.freeze({
                 restoredVersion: '1.1.0',
                 restored: true,
             });
-            expect(manager.getRecord(EXTENSION_IDS.configGenerator)).to.include(
-                { version: '1.1.0', enabled: true },
+            expect(manager.getRecord(EXECUTABLE_EXTENSION_ID)).to.include({
+                version: '1.1.0',
+                enabled: true,
+            });
+            expect(manager.getHealth(EXECUTABLE_EXTENSION_ID).status).to.equal(
+                'healthy',
             );
-            expect(
-                manager.getHealth(EXTENSION_IDS.configGenerator).status,
-            ).to.equal('healthy');
-            expect(store.read('configGenerator')).to.deep.equal(
+            expect(store.read('externalExtensionData')).to.deep.equal(
                 preservedProjects,
             );
         } finally {
@@ -1020,14 +1112,10 @@ module.exports = Object.freeze({
     });
 
     it('keeps only three verified rollback packages and removes the pruned version from disk', async function () {
-        const repository = staticConfigGeneratorRepository();
-        const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
-        const testKeyId = 'config-generator-history-test-key';
+        const repository = executableRelease();
         const releases = ['1.2.0', '1.3.0', '1.4.0', '1.5.0'].map((version) =>
-            signedConfigGeneratorRelease(repository, {
+            executableRelease({
                 version,
-                keyId: testKeyId,
-                privateKey,
             }),
         );
         const basePath = fs.mkdtempSync(
@@ -1052,41 +1140,26 @@ module.exports = Object.freeze({
                             ? activeCatalog
                             : packages.get(url),
                     ),
-                trustedKeys: {
-                    [testKeyId]: publicKey.export({
-                        type: 'spki',
-                        format: 'pem',
-                    }),
-                },
-                trustedOfficialKeyIds: {
-                    [EXTENSION_IDS.configGenerator]: [
-                        repository.packageDocument.signature.keyId,
-                        testKeyId,
-                    ],
-                },
             });
             await manager.addSource({ url: repository.sourceUrl });
-            await manager.installFromSource(EXTENSION_IDS.configGenerator);
+            await manager.installFromSource(EXECUTABLE_EXTENSION_ID);
             const packageDirectories = new Map([
                 [
                     '1.1.0',
-                    manager.getRecord(EXTENSION_IDS.configGenerator)
-                        .packageDirectory,
+                    manager.getRecord(EXECUTABLE_EXTENSION_ID).packageDirectory,
                 ],
             ]);
 
             for (const release of releases) {
                 activeCatalog = release.catalog;
-                const updated = await manager.update(
-                    EXTENSION_IDS.configGenerator,
-                );
+                const updated = await manager.update(EXECUTABLE_EXTENSION_ID);
                 expect(updated.status).to.equal('updated-disabled');
                 expect(updated).not.to.have.property('cleanupWarning');
-                const record = manager.getRecord(EXTENSION_IDS.configGenerator);
+                const record = manager.getRecord(EXECUTABLE_EXTENSION_ID);
                 packageDirectories.set(record.version, record.packageDirectory);
             }
 
-            const current = manager.getRecord(EXTENSION_IDS.configGenerator);
+            const current = manager.getRecord(EXECUTABLE_EXTENSION_ID);
             expect(current.version).to.equal('1.5.0');
             expect(
                 current.rollbackHistory.map(({ version }) => version),
@@ -1187,88 +1260,8 @@ module.exports = Object.freeze({
         );
     });
 
-    it('rejects unauthorized or tampered executable source mirrors', async function () {
-        const repository = staticConfigGeneratorRepository();
-        const rogueKeys = crypto.generateKeyPairSync('ed25519');
-        const rogueKeyId = 'globally-trusted-but-wrong-extension-key';
-        const rogueRelease = signedConfigGeneratorRelease(repository, {
-            version: '1.2.0',
-            keyId: rogueKeyId,
-            privateKey: rogueKeys.privateKey,
-        });
-        const wrongKeyManager = new ExtensionManager({
-            store: createStore(undefined),
-            env: { isNode: true },
-            packageStore: null,
-            trustedKeys: {
-                [rogueKeyId]: rogueKeys.publicKey.export({
-                    type: 'spki',
-                    format: 'pem',
-                }),
-            },
-            sourceFetcher: async (url) =>
-                response(
-                    url === repository.sourceUrl
-                        ? rogueRelease.catalog
-                        : rogueRelease.packageDocument,
-                ),
-        });
-        await wrongKeyManager.addSource({ url: repository.sourceUrl });
-        let wrongKeyError;
-        try {
-            await wrongKeyManager.installFromSource(
-                EXTENSION_IDS.configGenerator,
-            );
-        } catch (error) {
-            wrongKeyError = error;
-        }
-        expect(wrongKeyError).to.have.property(
-            'code',
-            'EXTENSION_SIGNING_KEY_NOT_ALLOWED',
-        );
-
-        const arbitraryExecutableCatalog = clone(repository.catalog);
-        arbitraryExecutableCatalog.entries[0].id =
-            'com.example.executable-extension';
-        arbitraryExecutableCatalog.entries[0].manifest.id =
-            'com.example.executable-extension';
-        const arbitraryManager = new ExtensionManager({
-            store: createStore(undefined),
-            env: { isNode: true },
-            packageStore: null,
-            sourceFetcher: async () => response(arbitraryExecutableCatalog),
-        });
-        let arbitraryError;
-        try {
-            await arbitraryManager.addSource({ url: repository.sourceUrl });
-        } catch (error) {
-            arbitraryError = error;
-        }
-        expect(arbitraryError).to.have.property(
-            'code',
-            'EXTENSION_SOURCE_MANIFEST_INVALID',
-        );
-
-        const changedManifestCatalog = clone(repository.catalog);
-        changedManifestCatalog.entries[0].manifest.description =
-            'Untrusted replacement';
-        const manifestManager = new ExtensionManager({
-            store: createStore(undefined),
-            env: { isNode: true },
-            packageStore: null,
-            sourceFetcher: async () => response(changedManifestCatalog),
-        });
-        let manifestError;
-        try {
-            await manifestManager.addSource({ url: repository.sourceUrl });
-        } catch (error) {
-            manifestError = error;
-        }
-        expect(manifestError).to.have.property(
-            'code',
-            'EXTENSION_SOURCE_OFFICIAL_MIRROR_UNAUTHORIZED',
-        );
-
+    it('rejects executable source digest drift and package tampering', async function () {
+        const repository = executableRelease();
         const changedDigestCatalog = clone(repository.catalog);
         changedDigestCatalog.entries[0].packageDigest = '0'.repeat(64);
         changedDigestCatalog.entries[0].packageDigests.node = '0'.repeat(64);
@@ -1276,24 +1269,27 @@ module.exports = Object.freeze({
             store: createStore(undefined),
             env: { isNode: true },
             packageStore: null,
-            sourceFetcher: async () => response(changedDigestCatalog),
+            sourceFetcher: async (url) =>
+                response(
+                    url === repository.sourceUrl
+                        ? changedDigestCatalog
+                        : repository.packageDocument,
+                ),
         });
+        await digestManager.addSource({ url: repository.sourceUrl });
         let digestError;
         try {
-            await digestManager.addSource({ url: repository.sourceUrl });
+            await digestManager.installFromSource(EXECUTABLE_EXTENSION_ID);
         } catch (error) {
             digestError = error;
         }
         expect(digestError).to.have.property(
             'code',
-            'EXTENSION_CATALOG_PACKAGE_MISMATCH',
+            'EXTENSION_SOURCE_PACKAGE_DIGEST_MISMATCH',
         );
 
         const tamperedPackage = clone(repository.packageDocument);
-        tamperedPackage.signature.value = `${tamperedPackage.signature.value.slice(
-            0,
-            -2,
-        )}AA`;
+        tamperedPackage.payload.files['backend/index.cjs'] += '\n// tampered';
         const packageManager = new ExtensionManager({
             store: createStore(undefined),
             env: { isNode: true },
@@ -1308,19 +1304,36 @@ module.exports = Object.freeze({
         await packageManager.addSource({ url: repository.sourceUrl });
         let packageError;
         try {
-            await packageManager.installFromSource(
-                EXTENSION_IDS.configGenerator,
-            );
+            await packageManager.installFromSource(EXECUTABLE_EXTENSION_ID);
         } catch (error) {
             packageError = error;
         }
         expect(packageError).to.have.property(
             'code',
-            'EXTENSION_SIGNATURE_INVALID',
+            'EXTENSION_PACKAGE_DIGEST_INVALID',
         );
-        expect(
-            packageManager.getRecord(EXTENSION_IDS.configGenerator),
-        ).to.equal(null);
+        expect(packageManager.getRecord(EXECUTABLE_EXTENSION_ID)).to.equal(
+            null,
+        );
+
+        const forbiddenCatalog = clone(repository.catalog);
+        forbiddenCatalog.entries[0].manifest.kind = 'trusted-official';
+        const forbiddenManager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async () => response(forbiddenCatalog),
+        });
+        let forbiddenError;
+        try {
+            await forbiddenManager.addSource({ url: repository.sourceUrl });
+        } catch (error) {
+            forbiddenError = error;
+        }
+        expect(forbiddenError).to.have.property(
+            'code',
+            'EXTENSION_COMMUNITY_EXECUTION_FORBIDDEN',
+        );
     });
 
     it('installs an inline content package from a catalog snapshot without refetching it', async function () {

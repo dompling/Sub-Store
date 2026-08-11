@@ -254,7 +254,7 @@ function URI_SS() {
         // handle IPV4 and IPV6
         let serverAndPortArray = content.match(/@([^/?]*)(\/|\?|$)/);
 
-        let userInfoStr = decodeShadowsocksUserInfo(content.split('@')[0]);
+        let userInfoStr;
 
         let query = '';
         if (!serverAndPortArray) {
@@ -280,9 +280,12 @@ function URI_SS() {
             }
             userInfoStr = content.match(/(^.*)@/)?.[1];
             serverAndPortArray = content.match(/@([^/@?]*)(\/|\?|$)/);
-        } else if (content.includes('?')) {
-            const parsed = content.match(/(\?.*)$/);
-            query = parsed[1];
+        } else {
+            userInfoStr = decodeShadowsocksUserInfo(content.split('@')[0]);
+            if (content.includes('?')) {
+                const parsed = content.match(/(\?.*)$/);
+                query = parsed[1];
+            }
         }
         const params = {};
         for (const addon of query.replace(/^\?/, '').split('&')) {

@@ -13,7 +13,6 @@ export const EXTENSION_HOST_API_VERSION = '1.0.0';
 export const EXTENSION_RUNTIME_REVISION = 1;
 
 export const EXTENSION_IDS = Object.freeze({
-    configGenerator: 'org.substore.config-generator',
     configHosting: 'org.substore.config-hosting',
 });
 
@@ -21,6 +20,7 @@ export const EXTENSION_KINDS = Object.freeze([
     'bundled',
     'trusted-official',
     'content',
+    'executable',
     'sandboxed-ui',
     'isolated-service',
 ]);
@@ -296,18 +296,32 @@ export function listManifestContributionIds(manifest) {
 export function routeExecutionLane(manifest, route, method) {
     const lanes = manifest?.scriptExecutionLanes || {};
     const normalizedMethod = method ? `${method}`.toUpperCase() : null;
+    const matchesRoute = (candidate) => {
+        const pattern = `${candidate || ''}`.replace(/^\/+|\/+$/g, '');
+        const value = `${route || ''}`.replace(/^\/+|\/+$/g, '');
+        if (pattern === value) return true;
+        const expression = pattern
+            .split('/')
+            .map((segment) => {
+                if (segment === '**') return '.*';
+                if (segment.startsWith(':')) return '[^/]+';
+                return segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            })
+            .join('/');
+        return new RegExp(`^${expression}$`).test(value);
+    };
     for (const [laneId, lane] of Object.entries(lanes)) {
         for (const candidate of lane.routes || []) {
             if (typeof candidate === 'object') {
                 if (
-                    candidate.path === route &&
+                    matchesRoute(candidate.path) &&
                     (!candidate.method ||
                         `${candidate.method}`.toUpperCase() ===
                             normalizedMethod)
                 ) {
                     return laneId;
                 }
-            } else if (candidate === route) {
+            } else if (matchesRoute(candidate)) {
                 return laneId;
             }
         }
