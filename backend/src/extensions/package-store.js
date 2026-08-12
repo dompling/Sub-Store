@@ -565,8 +565,19 @@ export class NodeExtensionPackageStore {
             version,
             packageDigest,
         );
-        if (this.fs.existsSync(finalDirectory)) {
+        const replacingExisting =
+            this.fs.existsSync(finalDirectory) && options.replace === true;
+        if (this.fs.existsSync(finalDirectory) && !replacingExisting) {
             return this.verifyDirectory(finalDirectory, packageInput, options);
+        }
+
+        if (replacingExisting) {
+            // The explicit reinstall path is also the repair path for a
+            // damaged local copy. Validate the downloaded package input and
+            // ownership boundary, then atomically replace the managed
+            // directory even when its current bytes no longer verify.
+            this.assertExistingOwnedDirectory(extensionId, finalDirectory);
+            this.evictRequireCache(finalDirectory);
         }
 
         const parent = this.path.dirname(finalDirectory);
@@ -576,6 +587,11 @@ export class NodeExtensionPackageStore {
         const stagingDirectory = `${finalDirectory}.staging-${Date.now()}-${Math.random()
             .toString(36)
             .slice(2)}`;
+        const backupDirectory = replacingExisting
+            ? `${finalDirectory}.reinstall-backup-${Date.now()}-${Math.random()
+                  .toString(36)
+                  .slice(2)}`
+            : null;
         this.fs.mkdirSync(stagingDirectory, { recursive: true });
 
         try {
@@ -649,10 +665,36 @@ export class NodeExtensionPackageStore {
                 ),
                 'utf8',
             );
-            this.fs.renameSync(stagingDirectory, finalDirectory);
+            if (replacingExisting) {
+                this.fs.renameSync(finalDirectory, backupDirectory);
+                try {
+                    this.fs.renameSync(stagingDirectory, finalDirectory);
+                    this.fs.rmSync(backupDirectory, {
+                        recursive: true,
+                        force: true,
+                    });
+                } catch (error) {
+                    this.fs.rmSync(finalDirectory, {
+                        recursive: true,
+                        force: true,
+                    });
+                    this.fs.renameSync(backupDirectory, finalDirectory);
+                    throw error;
+                }
+            } else {
+                this.fs.renameSync(stagingDirectory, finalDirectory);
+            }
         } catch (error) {
             this.fs.rmSync(stagingDirectory, { recursive: true, force: true });
-            if (this.fs.existsSync(finalDirectory)) {
+            if (
+                replacingExisting &&
+                backupDirectory &&
+                this.fs.existsSync(backupDirectory) &&
+                !this.fs.existsSync(finalDirectory)
+            ) {
+                this.fs.renameSync(backupDirectory, finalDirectory);
+            }
+            if (!replacingExisting && this.fs.existsSync(finalDirectory)) {
                 return this.verifyDirectory(
                     finalDirectory,
                     packageInput,

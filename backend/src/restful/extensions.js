@@ -87,6 +87,7 @@ function lifecycleInput(req) {
         runtime: body.runtime,
         version: body.version,
         variant: body.variant,
+        reinstall: body.reinstall === true,
         expectedRevision:
             body.expectedRevision ??
             req.headers?.['x-sub-store-extension-revision'],
@@ -215,10 +216,12 @@ export function registerExtensionControlRoutes(
     });
 
     $app.get('/api/extensions/sources', (req, res) => {
-        const revision = manager.getRuntimeManifest().revision;
-        const etag = setEtag(res, `sources-${revision}`);
+        const runtime = manager.getRuntimeManifest();
+        const { revision, storageIdentity } = runtime;
+        const etag = setEtag(res, `${storageIdentity}-${revision}-sources`);
         if (notModified(req, res, etag)) return;
         success(res, {
+            storageIdentity,
             revision,
             items: manager.getSources(),
         });

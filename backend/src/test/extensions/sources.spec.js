@@ -1379,6 +1379,48 @@ module.exports = Object.freeze({
                 enabled: true,
             });
 
+            const reinstalledCurrent = await manager.update(
+                EXECUTABLE_EXTENSION_ID,
+                {
+                    version: '1.3.0',
+                    reinstall: true,
+                },
+            );
+            expect(reinstalledCurrent).to.include({
+                status: 'updated-enabled',
+            });
+            expect(reinstalledCurrent).to.not.have.property('noOp');
+            expect(reinstalledCurrent.record).to.include({
+                version: '1.3.0',
+                enabled: true,
+            });
+            expect(reinstalledCurrent.record.rollbackVersions).to.not.include(
+                '1.3.0',
+            );
+
+            const currentRecord = manager.getRecord(EXECUTABLE_EXTENSION_ID);
+            fs.writeFileSync(
+                currentRecord.entrypoint,
+                'module.exports = { tampered: true };',
+                'utf8',
+            );
+            expect(() => manager.getHealth(EXECUTABLE_EXTENSION_ID)).to.not
+                .throw;
+            expect(manager.getHealth(EXECUTABLE_EXTENSION_ID).status).to.equal(
+                'unhealthy',
+            );
+            const repairedCurrent = await manager.update(
+                EXECUTABLE_EXTENSION_ID,
+                {
+                    version: '1.3.0',
+                    reinstall: true,
+                },
+            );
+            expect(repairedCurrent).to.include({ status: 'updated-enabled' });
+            expect(manager.getHealth(EXECUTABLE_EXTENSION_ID).status).to.equal(
+                'healthy',
+            );
+
             activeCatalog = clone(v2.catalog);
             activeCatalog.entries[0].releases = [
                 clone(v2.catalog.entries[0]),

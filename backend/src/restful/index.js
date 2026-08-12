@@ -56,7 +56,7 @@ export default function serve() {
     let host;
     if ($.env.isNode) {
         port = eval('process.env.SUB_STORE_BACKEND_API_PORT') || 3000;
-        host = eval('process.env.SUB_STORE_BACKEND_API_HOST') || '::';
+        host = eval('process.env.SUB_STORE_BACKEND_API_HOST') || '127.0.0.1';
     }
     const $app = express({ substore: $, port, host });
     if ($.env.isNode) {

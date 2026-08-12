@@ -1186,32 +1186,54 @@ export class ExtensionManager {
             : createEmptyState();
         const nextIds = Object.keys(normalized.installed).sort();
         const previousIds = new Set(Object.keys(previous.installed));
-
-        for (const extensionId of nextIds) {
-            const nextRecord = normalized.installed[extensionId];
-            const previousRecord = previous.installed[extensionId];
-            const recordMissing =
-                this.store.read(extensionRecordKey(extensionId)) === undefined;
-            if (
-                recordMissing ||
-                canonicalJson(previousRecord) !== canonicalJson(nextRecord)
-            ) {
-                this.store.write(
-                    JSON.stringify(nextRecord),
-                    extensionRecordKey(extensionId),
-                );
+        const touchedKeys = new Map();
+        const remember = (key) => {
+            if (!touchedKeys.has(key))
+                touchedKeys.set(key, this.store.read(key));
+        };
+        const restore = () => {
+            for (const [key, value] of [...touchedKeys].reverse()) {
+                if (value === undefined) this._deleteStoreKey(key);
+                else this.store.write(value, key);
             }
-            previousIds.delete(extensionId);
-        }
+        };
 
-        this.store.write(
-            JSON.stringify(stateIndexFromState(normalized)),
-            EXTENSION_STATE_INDEX_KEY,
-        );
-        for (const removedExtensionId of previousIds) {
-            this._deleteStoreKey(extensionRecordKey(removedExtensionId));
+        try {
+            for (const extensionId of nextIds) {
+                const nextRecord = normalized.installed[extensionId];
+                const previousRecord = previous.installed[extensionId];
+                const key = extensionRecordKey(extensionId);
+                const storedRecord = this.store.read(key);
+                const recordMissing = storedRecord === undefined;
+                if (
+                    recordMissing ||
+                    canonicalJson(previousRecord) !== canonicalJson(nextRecord)
+                ) {
+                    remember(key);
+                    this.store.write(JSON.stringify(nextRecord), key);
+                }
+                previousIds.delete(extensionId);
+            }
+
+            remember(EXTENSION_STATE_INDEX_KEY);
+            this.store.write(
+                JSON.stringify(stateIndexFromState(normalized)),
+                EXTENSION_STATE_INDEX_KEY,
+            );
+            for (const removedExtensionId of previousIds) {
+                const key = extensionRecordKey(removedExtensionId);
+                remember(key);
+                this._deleteStoreKey(key);
+            }
+            return normalized;
+        } catch (error) {
+            try {
+                restore();
+            } catch (rollbackError) {
+                error.rollbackError = rollbackError;
+            }
+            throw error;
         }
-        return normalized;
     }
 
     _commit(mutator, { expectedRevision } = {}) {
@@ -3337,42 +3359,44 @@ export class ExtensionManager {
                         },
                     );
                 }
-                let noOpResult;
-                this._commit(
-                    (state) => {
-                        const record = state.installed[canonicalId];
-                        const task = this._createTask(state, {
-                            extensionId: canonicalId,
-                            action: taskAction,
-                            idempotencyKey: input.idempotencyKey,
-                        });
-                        const status =
-                            taskAction === 'update'
-                                ? 'current'
-                                : 'already-installed';
-                        this._finishTask(state, task, {
-                            extensionId: canonicalId,
-                            status,
-                            noOp: true,
-                        });
-                        this._recordAudit(state, {
-                            action: taskAction,
-                            extensionId: canonicalId,
-                            result: `${status}-no-op`,
-                        });
-                        noOpResult = {
-                            taskId: task.id,
-                            status,
-                            noOp: true,
-                            record: publicRecord(record),
-                        };
-                        return state;
-                    },
-                    { expectedRevision: input.expectedRevision },
-                );
-                const completedTask = this.getTask(noOpResult.taskId);
-                if (completedTask) noOpResult.task = clone(completedTask);
-                return noOpResult;
+                if (input.reinstall !== true) {
+                    let noOpResult;
+                    this._commit(
+                        (state) => {
+                            const record = state.installed[canonicalId];
+                            const task = this._createTask(state, {
+                                extensionId: canonicalId,
+                                action: taskAction,
+                                idempotencyKey: input.idempotencyKey,
+                            });
+                            const status =
+                                taskAction === 'update'
+                                    ? 'current'
+                                    : 'already-installed';
+                            this._finishTask(state, task, {
+                                extensionId: canonicalId,
+                                status,
+                                noOp: true,
+                            });
+                            this._recordAudit(state, {
+                                action: taskAction,
+                                extensionId: canonicalId,
+                                result: `${status}-no-op`,
+                            });
+                            noOpResult = {
+                                taskId: task.id,
+                                status,
+                                noOp: true,
+                                record: publicRecord(record),
+                            };
+                            return state;
+                        },
+                        { expectedRevision: input.expectedRevision },
+                    );
+                    const completedTask = this.getTask(noOpResult.taskId);
+                    if (completedTask) noOpResult.task = clone(completedTask);
+                    return noOpResult;
+                }
             }
         }
         const stagedPackage = this.packageStore
@@ -3380,6 +3404,7 @@ export class ExtensionManager {
                   allowCommunityContent: isCommunity,
                   allowDigestOnly:
                       verified.verification?.trust === 'integrity-only',
+                  replace: input.reinstall === true,
               })
             : null;
         const shouldReactivatePrevious = previous?.enabled === true;
@@ -3465,12 +3490,15 @@ export class ExtensionManager {
                             input.source ||
                             (isCommunity ? 'community' : 'official-local'),
                         rollbackHistory:
-                            previousRecord?.installationStatus === 'installed'
+                            previousRecord?.installationStatus ===
+                                'installed' &&
+                            previousRecord.packageDigest !==
+                                verified.receipt.packageDigest
                                 ? appendRollbackSnapshot(
                                       previousRecord.rollbackHistory,
                                       previousRecord,
                                   )
-                                : [],
+                                : clone(previousRecord?.rollbackHistory || []),
                     };
                     state.installed[canonicalId] = record;
                     state.dataGeneration += 1;
@@ -4051,7 +4079,10 @@ export class ExtensionManager {
                 );
             }
         }
-        if (comparison === 0 || (comparison < 0 && !input.version)) {
+        if (
+            (comparison === 0 && input.reinstall !== true) ||
+            (comparison < 0 && !input.version)
+        ) {
             let noOpResult;
             this._commit(
                 (state) => {
@@ -4090,6 +4121,7 @@ export class ExtensionManager {
 
         const installed = await this.installFromSource(canonicalId, {
             ...input,
+            reinstall: comparison === 0 && input.reinstall === true,
             allowDowngrade: comparison < 0 && Boolean(input.version),
             expectedRevision: refreshedState.revision,
             taskAction: 'update',

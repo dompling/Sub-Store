@@ -646,6 +646,57 @@ describe('Extension Host foundation', function () {
         ]);
     });
 
+    it('restores extension records when the shared index write fails', function () {
+        const recordKey = `#sub-store-extension:${GENERIC_REMOTE_EXTENSION_ID}`;
+        const initialRecord = {
+            extensionId: GENERIC_REMOTE_EXTENSION_ID,
+            version: '1.1.0',
+            enabled: false,
+        };
+        const baseStore = createKeyStore({
+            [recordKey]: JSON.stringify(initialRecord),
+            '#sub-store-extension-index': JSON.stringify({
+                schemaVersion: 1,
+                revision: 2,
+                storeRevision: 2,
+                dataGeneration: 1,
+                extensionIds: [GENERIC_REMOTE_EXTENSION_ID],
+                sources: {},
+                migrations: {},
+                tasks: [],
+                audit: [],
+            }),
+        });
+        let failIndexWrite = true;
+        const store = {
+            ...baseStore,
+            write(value, key) {
+                if (key === '#sub-store-extension-index' && failIndexWrite) {
+                    failIndexWrite = false;
+                    throw new Error('simulated index write failure');
+                }
+                return baseStore.write(value, key);
+            },
+        };
+        const manager = new ExtensionManager({
+            store,
+            env: { isNode: true },
+        });
+
+        expect(() =>
+            manager._commit((state) => {
+                state.installed[GENERIC_REMOTE_EXTENSION_ID].enabled = true;
+                return state;
+            }),
+        ).to.throw('simulated index write failure');
+
+        expect(JSON.parse(store.read(recordKey))).to.deep.equal(initialRecord);
+        expect(manager.getRuntimeManifest().revision).to.equal(2);
+        expect(manager.getRecord(GENERIC_REMOTE_EXTENSION_ID).enabled).to.equal(
+            false,
+        );
+    });
+
     it('allows extension management by default when no admin token is configured', async function () {
         const previousToken = process.env.SUB_STORE_EXTENSION_ADMIN_TOKEN;
         const previousHash = process.env.SUB_STORE_EXTENSION_ADMIN_TOKEN_HASH;
@@ -705,6 +756,20 @@ describe('Extension Host foundation', function () {
             );
             expect(sourcesResponse.statusCode).to.equal(200);
             expect(sourcesResponse.body.data.items).to.deep.equal([]);
+            expect(sourcesResponse.headers.ETag).to.equal(
+                `W/"extensions-${sourcesResponse.body.data.storageIdentity}-${sourcesResponse.body.data.revision}-sources"`,
+            );
+
+            const unchangedSourcesResponse = createResponse();
+            await handlers.get('GET /api/extensions/sources')(
+                {
+                    headers: {
+                        'if-none-match': sourcesResponse.headers.ETag,
+                    },
+                },
+                unchangedSourcesResponse,
+            );
+            expect(unchangedSourcesResponse.statusCode).to.equal(304);
 
             const installResponse = createResponse();
             await handlers.get('POST /api/admin/extensions/:id/install')(
@@ -755,6 +820,43 @@ describe('Extension Host foundation', function () {
             else
                 process.env.SUB_STORE_EXTENSION_ADMIN_TOKEN_HASH = previousHash;
         }
+    });
+
+    it('scopes source cache validators to the backend storage identity', async function () {
+        const firstManager = new ExtensionManager({
+            store: { ...createKeyStore(), identity: 'source-etag-store-a' },
+            env: { isNode: true },
+        });
+        const secondManager = new ExtensionManager({
+            store: { ...createKeyStore(), identity: 'source-etag-store-b' },
+            env: { isNode: true },
+        });
+        const firstRoutes = createRouteApp();
+        const secondRoutes = createRouteApp();
+        registerExtensionControlRoutes(firstRoutes.app, firstManager);
+        registerExtensionControlRoutes(secondRoutes.app, secondManager);
+
+        const firstResponse = createResponse();
+        await firstRoutes.handlers.get('GET /api/extensions/sources')(
+            { headers: {} },
+            firstResponse,
+        );
+        const secondResponse = createResponse();
+        await secondRoutes.handlers.get('GET /api/extensions/sources')(
+            { headers: { 'if-none-match': firstResponse.headers.ETag } },
+            secondResponse,
+        );
+
+        expect(firstResponse.body.data.revision).to.equal(
+            secondResponse.body.data.revision,
+        );
+        expect(firstResponse.body.data.storageIdentity).to.not.equal(
+            secondResponse.body.data.storageIdentity,
+        );
+        expect(secondResponse.statusCode).to.equal(200);
+        expect(secondResponse.headers.ETag).to.not.equal(
+            firstResponse.headers.ETag,
+        );
     });
 
     it('requires authentication only when an extension admin token is configured', async function () {
