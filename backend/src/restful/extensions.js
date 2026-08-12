@@ -339,7 +339,10 @@ export function registerExtensionControlRoutes(
                 assertAdmin(req);
                 assertNoClientPackage(req);
                 const input = lifecycleInput(req);
-                const entry = manager.findEntry(req.params.id);
+                const entry =
+                    manager.findEntry(req.params.id, {
+                        version: input.version,
+                    }) || manager.findEntry(req.params.id);
                 return entry?.sourceId
                     ? manager.installFromSource(req.params.id, input)
                     : manager.install(req.params.id, input);

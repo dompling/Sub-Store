@@ -12,6 +12,7 @@ import {
     normalizeExtensionManifest,
 } from './contracts';
 import { diagnosticDigest, isSha256Digest, sha256Hex } from './signature';
+import { compare as compareSemver, valid as validSemver } from 'semver';
 
 export const EXTENSION_SOURCE_SCHEMA_VERSION = 1;
 export const MAX_EXTENSION_SOURCE_BYTES = 4 * 1024 * 1024;
@@ -560,6 +561,260 @@ function normalizeSourcePublisher(value) {
     return id && name ? { id, name } : null;
 }
 
+function normalizeReleaseMetadata(rawEntry) {
+    const releasedAt =
+        typeof rawEntry?.releasedAt === 'string' && rawEntry.releasedAt.trim()
+            ? rawEntry.releasedAt.trim()
+            : null;
+    if (releasedAt && !Number.isFinite(Date.parse(releasedAt))) {
+        throw sourceError(
+            'EXTENSION_SOURCE_RELEASE_METADATA_INVALID',
+            'Extension release timestamp is invalid',
+            {
+                version:
+                    rawEntry?.version || rawEntry?.manifest?.version || null,
+            },
+            422,
+        );
+    }
+    const stringMetadata = (field) => {
+        if (rawEntry?.[field] == null) return null;
+        const value = `${rawEntry[field]}`.trim();
+        if (!value || value.length > 200) {
+            throw sourceError(
+                'EXTENSION_SOURCE_RELEASE_METADATA_INVALID',
+                `Extension release ${field} is invalid`,
+                {
+                    version:
+                        rawEntry?.version ||
+                        rawEntry?.manifest?.version ||
+                        null,
+                    field,
+                },
+                422,
+            );
+        }
+        return value;
+    };
+    return {
+        releasedAt,
+        gitTag: stringMetadata('gitTag'),
+        gitCommit: stringMetadata('gitCommit'),
+    };
+}
+
+function normalizeCommunityEntry(
+    rawEntry,
+    { sourceUrl, sourceId, sourceAllowsLoopback, installable = true },
+) {
+    const manifestInput = rawEntry?.manifest || rawEntry;
+    let manifest;
+    try {
+        manifest = normalizeExtensionManifest(manifestInput);
+    } catch (error) {
+        throw sourceError(
+            'EXTENSION_SOURCE_MANIFEST_INVALID',
+            'Community extension manifest is invalid',
+            { cause: error.message },
+            422,
+        );
+    }
+    if (
+        !validSemver(manifest.version) ||
+        validSemver(manifest.version) !== manifest.version
+    ) {
+        throw sourceError(
+            'EXTENSION_SOURCE_VERSION_INVALID',
+            'Community extension releases must use a valid semantic version',
+            { extensionId: manifest.id, version: manifest.version },
+            422,
+        );
+    }
+    if (
+        installable &&
+        manifest.kind !== 'content' &&
+        manifest.kind !== 'executable'
+    ) {
+        throw sourceError(
+            'EXTENSION_COMMUNITY_EXECUTION_FORBIDDEN',
+            'Extension sources accept content or executable extensions',
+            { extensionId: manifest.id },
+            422,
+        );
+    }
+    const executable = installable && manifest.kind === 'executable';
+    const variants = Object.keys(manifest.variants || {});
+    if (installable && !variants.length) {
+        throw sourceError(
+            'EXTENSION_SOURCE_VARIANT_MISSING',
+            'Community extension must declare at least one package variant',
+            { extensionId: manifest.id },
+            422,
+        );
+    }
+    if (installable) {
+        for (const variantName of variants) {
+            if (
+                !executable &&
+                manifest.variants[variantName]?.containsExecutableCode === true
+            ) {
+                throw sourceError(
+                    'EXTENSION_COMMUNITY_EXECUTION_FORBIDDEN',
+                    'Community extension variants cannot contain executable code',
+                    { extensionId: manifest.id, variant: variantName },
+                    422,
+                );
+            }
+        }
+    }
+    if (executable && !variants.includes('node')) {
+        throw sourceError(
+            'EXTENSION_SOURCE_VARIANT_MISSING',
+            'Executable extensions must declare a Node package variant',
+            { extensionId: manifest.id },
+            422,
+        );
+    }
+    const nodeVariant = manifest.variants?.node;
+    if (
+        executable &&
+        (nodeVariant?.containsExecutableCode !== true ||
+            typeof nodeVariant?.entrypoint !== 'string' ||
+            !nodeVariant.entrypoint)
+    ) {
+        throw sourceError(
+            'EXTENSION_SOURCE_EXECUTABLE_CONTRACT_INVALID',
+            'Executable extensions must declare a digest-bound Node entrypoint',
+            { extensionId: manifest.id },
+            422,
+        );
+    }
+    const selectedVariant =
+        rawEntry?.selectedVariant ||
+        (executable
+            ? 'node'
+            : variants.includes('node')
+            ? 'node'
+            : variants[0] || null);
+    const rawPackageUrl =
+        rawEntry?.payload || rawEntry?.files
+            ? sourceUrl
+            : selectedVariant
+            ? packageUrlForEntry(rawEntry, selectedVariant)
+            : null;
+    if (installable && !rawPackageUrl) {
+        throw sourceError(
+            'EXTENSION_SOURCE_PACKAGE_URL_MISSING',
+            'Community extension entry does not provide a package URL',
+            { extensionId: manifest.id },
+            422,
+        );
+    }
+    let packageUrl = null;
+    if (rawPackageUrl) {
+        try {
+            packageUrl = normalizeExtensionSourceUrl(
+                new URL(rawPackageUrl, sourceUrl).toString(),
+            );
+            assertLoopbackBoundary(new URL(packageUrl), sourceAllowsLoopback);
+        } catch (error) {
+            throw sourceError(
+                error.code || 'EXTENSION_SOURCE_PACKAGE_URL_INVALID',
+                error.message,
+                { extensionId: manifest.id },
+                error.statusCode || 422,
+            );
+        }
+    }
+    const packageDigest = selectedVariant
+        ? packageDigestForEntry(rawEntry, selectedVariant)
+        : null;
+    if (installable && !packageDigest) {
+        throw sourceError(
+            'EXTENSION_SOURCE_PACKAGE_DIGEST_MISSING',
+            'Community extension entries must declare an immutable SHA-256 package digest',
+            { extensionId: manifest.id, selectedVariant },
+            422,
+        );
+    }
+    const inlinePackage =
+        installable && (rawEntry?.payload || rawEntry?.files)
+            ? cloneExtensionValue(rawEntry)
+            : null;
+    const metadata = normalizeReleaseMetadata(rawEntry);
+    return {
+        id: manifest.id,
+        version: manifest.version,
+        name: manifest.name,
+        description: manifest.description,
+        kind: manifest.kind,
+        distribution: installable
+            ? executable
+                ? SOURCE_EXECUTABLE_DISTRIBUTION
+                : 'community'
+            : rawEntry?.distribution || manifest.distribution || manifest.kind,
+        source: sourceUrl,
+        sourceId,
+        sourceName: rawEntry.sourceName || rawEntry.publisher?.name || null,
+        manifest: cloneExtensionValue(manifest),
+        manifestDigest:
+            sha256Hex(canonicalJson(manifest)) ||
+            diagnosticDigest(canonicalJson(manifest)),
+        packageUrls:
+            packageUrl && selectedVariant
+                ? { [selectedVariant]: packageUrl }
+                : {},
+        packageDigests:
+            packageDigest && selectedVariant
+                ? { [selectedVariant]: packageDigest }
+                : {},
+        selectedVariant,
+        installable,
+        releasedAt: metadata.releasedAt,
+        gitTag: metadata.gitTag,
+        gitCommit: metadata.gitCommit,
+        catalogEntryDigest:
+            sha256Hex(canonicalJson(rawEntry)) ||
+            diagnosticDigest(canonicalJson(rawEntry)),
+        ...(inlinePackage ? { inlinePackage } : {}),
+    };
+}
+
+function assertSameReleaseContent(current, candidate) {
+    const immutableProjection = (release) => ({
+        manifestDigest: release.manifestDigest || null,
+        distribution: release.distribution || null,
+        selectedVariant: release.selectedVariant || null,
+        installable: release.installable !== false,
+        packageUrls: release.packageUrls || {},
+        packageDigests: release.packageDigests || {},
+    });
+    const previousProjection = immutableProjection(current);
+    const nextProjection = immutableProjection(candidate);
+    if (canonicalJson(previousProjection) !== canonicalJson(nextProjection)) {
+        throw sourceError(
+            'EXTENSION_SOURCE_VERSION_MUTATED',
+            'An extension source declared different immutable content for the same release version',
+            {
+                extensionId: candidate.id,
+                version: candidate.version,
+                previousManifestDigest: current.manifestDigest,
+                nextManifestDigest: candidate.manifestDigest,
+                previousPackageDigests: cloneExtensionValue(
+                    current.packageDigests || {},
+                ),
+                nextPackageDigests: cloneExtensionValue(
+                    candidate.packageDigests || {},
+                ),
+                previousImmutableProjection:
+                    cloneExtensionValue(previousProjection),
+                nextImmutableProjection: cloneExtensionValue(nextProjection),
+            },
+            422,
+        );
+    }
+}
+
 export function normalizeCommunityCatalog(document, sourceUrl, sourceId) {
     const { payload, envelope } = extractEntries(document);
     const publisher = normalizeSourcePublisher(payload.publisher);
@@ -581,143 +836,67 @@ export function normalizeCommunityCatalog(document, sourceUrl, sourceId) {
         );
     const entries = [];
     for (const rawEntry of rawEntries) {
-        const manifestInput = rawEntry?.manifest || rawEntry;
-        if (
-            manifestInput?.kind !== 'content' &&
-            manifestInput?.kind !== 'executable'
-        ) {
-            throw sourceError(
-                'EXTENSION_COMMUNITY_EXECUTION_FORBIDDEN',
-                'Extension sources accept content or executable extensions',
-                { extensionId: manifestInput?.id || null },
-                422,
-            );
-        }
-        let manifest;
-        try {
-            manifest = normalizeExtensionManifest(manifestInput);
-        } catch (error) {
-            throw sourceError(
-                'EXTENSION_SOURCE_MANIFEST_INVALID',
-                'Community extension manifest is invalid',
-                { cause: error.message },
-                422,
-            );
-        }
-        if (manifest.kind !== 'content' && manifest.kind !== 'executable')
-            throw sourceError(
-                'EXTENSION_COMMUNITY_EXECUTION_FORBIDDEN',
-                'Extension source manifest kind is not installable',
-                { extensionId: manifest.id },
-                422,
-            );
-        const executable = manifest.kind === 'executable';
-        const variants = Object.keys(manifest.variants || {});
-        if (!variants.length)
-            throw sourceError(
-                'EXTENSION_SOURCE_VARIANT_MISSING',
-                'Community extension must declare at least one package variant',
-                { extensionId: manifest.id },
-                422,
-            );
-        for (const variantName of variants) {
-            if (
-                !executable &&
-                manifest.variants[variantName]?.containsExecutableCode === true
-            )
+        const current = normalizeCommunityEntry(rawEntry, {
+            sourceUrl,
+            sourceId,
+            sourceAllowsLoopback,
+            installable: true,
+        });
+        const releasesByVersion = new Map([[current.version, current]]);
+        for (const rawRelease of Array.isArray(rawEntry?.releases)
+            ? rawEntry.releases
+            : []) {
+            const release = normalizeCommunityEntry(rawRelease, {
+                sourceUrl,
+                sourceId,
+                sourceAllowsLoopback,
+                installable: rawRelease?.installable !== false,
+            });
+            if (release.id !== current.id) {
                 throw sourceError(
-                    'EXTENSION_COMMUNITY_EXECUTION_FORBIDDEN',
-                    'Community extension variants cannot contain executable code',
-                    { extensionId: manifest.id, variant: variantName },
+                    'EXTENSION_SOURCE_RELEASE_ID_MISMATCH',
+                    'Extension release history must use the parent extension id',
+                    {
+                        extensionId: current.id,
+                        releaseExtensionId: release.id,
+                        version: release.version,
+                    },
                     422,
                 );
-        }
-        if (executable && !variants.includes('node'))
-            throw sourceError(
-                'EXTENSION_SOURCE_VARIANT_MISSING',
-                'Executable extensions must declare a Node package variant',
-                { extensionId: manifest.id },
-                422,
-            );
-        const nodeVariant = manifest.variants?.node;
-        if (
-            executable &&
-            (nodeVariant?.containsExecutableCode !== true ||
-                typeof nodeVariant?.entrypoint !== 'string' ||
-                !nodeVariant.entrypoint)
-        )
-            throw sourceError(
-                'EXTENSION_SOURCE_EXECUTABLE_CONTRACT_INVALID',
-                'Executable extensions must declare a digest-bound Node entrypoint',
-                { extensionId: manifest.id },
-                422,
-            );
-        const selectedVariant = executable
-            ? 'node'
-            : variants.includes('node')
-            ? 'node'
-            : variants[0];
-        const rawPackageUrl =
-            rawEntry?.payload || rawEntry?.files
-                ? sourceUrl
-                : packageUrlForEntry(rawEntry, selectedVariant);
-        if (!rawPackageUrl)
-            throw sourceError(
-                'EXTENSION_SOURCE_PACKAGE_URL_MISSING',
-                'Community extension entry does not provide a package URL',
-                { extensionId: manifest.id },
-                422,
-            );
-        let packageUrl;
-        try {
-            packageUrl = normalizeExtensionSourceUrl(
-                new URL(rawPackageUrl, sourceUrl).toString(),
-            );
-            assertLoopbackBoundary(new URL(packageUrl), sourceAllowsLoopback);
-        } catch (error) {
-            throw sourceError(
-                error.code || 'EXTENSION_SOURCE_PACKAGE_URL_INVALID',
-                error.message,
-                { extensionId: manifest.id },
-                error.statusCode || 422,
+            }
+            if (compareSemver(release.version, current.version) > 0) {
+                throw sourceError(
+                    'EXTENSION_SOURCE_RELEASE_ORDER_INVALID',
+                    'Extension catalog latest version must be the highest release version',
+                    {
+                        extensionId: current.id,
+                        latestVersion: current.version,
+                        releaseVersion: release.version,
+                    },
+                    422,
+                );
+            }
+            const existing = releasesByVersion.get(release.version);
+            if (existing) assertSameReleaseContent(existing, release);
+            releasesByVersion.set(
+                release.version,
+                existing
+                    ? {
+                          ...release,
+                          ...existing,
+                          releasedAt: release.releasedAt || existing.releasedAt,
+                          gitTag: release.gitTag || existing.gitTag,
+                          gitCommit: release.gitCommit || existing.gitCommit,
+                      }
+                    : release,
             );
         }
-        const packageDigest = packageDigestForEntry(rawEntry, selectedVariant);
-        if (!packageDigest) {
-            throw sourceError(
-                'EXTENSION_SOURCE_PACKAGE_DIGEST_MISSING',
-                'Community extension entries must declare an immutable SHA-256 package digest',
-                { extensionId: manifest.id, selectedVariant },
-                422,
-            );
-        }
-        const inlinePackage =
-            rawEntry?.payload || rawEntry?.files
-                ? cloneExtensionValue(rawEntry)
-                : null;
+        const releases = [...releasesByVersion.values()].sort((left, right) =>
+            compareSemver(right.version, left.version),
+        );
         entries.push({
-            id: manifest.id,
-            version: manifest.version,
-            name: manifest.name,
-            description: manifest.description,
-            kind: manifest.kind,
-            distribution: executable
-                ? SOURCE_EXECUTABLE_DISTRIBUTION
-                : 'community',
-            source: sourceUrl,
-            sourceId,
-            sourceName: rawEntry.sourceName || rawEntry.publisher?.name || null,
-            manifest: cloneExtensionValue(manifest),
-            manifestDigest:
-                sha256Hex(canonicalJson(manifest)) ||
-                diagnosticDigest(canonicalJson(manifest)),
-            packageUrls: { [selectedVariant]: packageUrl },
-            packageDigests: { [selectedVariant]: packageDigest },
-            selectedVariant,
-            catalogEntryDigest:
-                sha256Hex(canonicalJson(rawEntry)) ||
-                diagnosticDigest(canonicalJson(rawEntry)),
-            ...(inlinePackage ? { inlinePackage } : {}),
+            ...releasesByVersion.get(current.version),
+            releases,
         });
     }
     return {
@@ -741,6 +920,11 @@ export function publicExtensionSource(source) {
     const entries = (source.entries || []).map((entry) => {
         const publicEntry = { ...(entry || {}) };
         delete publicEntry.inlinePackage;
+        publicEntry.releases = (publicEntry.releases || []).map((release) => {
+            const publicRelease = { ...(release || {}) };
+            delete publicRelease.inlinePackage;
+            return publicRelease;
+        });
         return cloneExtensionValue(publicEntry);
     });
     return {

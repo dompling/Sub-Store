@@ -188,6 +188,7 @@ function executableRelease({
     version = '1.1.0',
     packageUrl = `https://example.test/extensions/executable-${version}.json`,
     backendEntrypoint,
+    storageSchemaVersion,
 } = {}) {
     const implementationAbi = 'example-executable@1';
     // Keep the package manifest in its authored form. Source ingestion adds
@@ -223,6 +224,9 @@ function executableRelease({
                 routes: ['status'],
             },
         },
+        ...(storageSchemaVersion == null
+            ? {}
+            : { storage: { schemaVersion: storageSchemaVersion } }),
     };
     const files = {
         'backend/index.cjs':
@@ -339,6 +343,94 @@ function resealCommunityPackage(document) {
 }
 
 describe('Community extension sources', function () {
+    it('normalizes immutable release history while keeping one source entry per extension', function () {
+        const v1 = executableRelease({ version: '1.1.0' });
+        const v2 = executableRelease({ version: '1.2.0' });
+        const catalog = clone(v2.catalog);
+        catalog.entries[0].releases = [
+            {
+                ...clone(v2.catalog.entries[0]),
+                releasedAt: '2026-08-12T01:00:00.000Z',
+                gitTag: `${EXECUTABLE_EXTENSION_ID}@1.2.0`,
+                gitCommit: '2'.repeat(40),
+            },
+            {
+                ...clone(v1.catalog.entries[0]),
+                releasedAt: '2026-08-11T01:00:00.000Z',
+                gitTag: `${EXECUTABLE_EXTENSION_ID}@1.1.0`,
+                gitCommit: '1'.repeat(40),
+            },
+        ];
+
+        const normalized = normalizeCommunityCatalog(
+            catalog,
+            v2.sourceUrl,
+            'source-history',
+        );
+        expect(normalized.entries).to.have.length(1);
+        expect(normalized.entries[0]).to.include({
+            id: EXECUTABLE_EXTENSION_ID,
+            version: '1.2.0',
+        });
+        expect(
+            normalized.entries[0].releases.map((release) => release.version),
+        ).to.deep.equal(['1.2.0', '1.1.0']);
+        expect(normalized.entries[0].releases[0]).to.include({
+            releasedAt: '2026-08-12T01:00:00.000Z',
+            gitTag: `${EXECUTABLE_EXTENSION_ID}@1.2.0`,
+            gitCommit: '2'.repeat(40),
+            installable: true,
+        });
+    });
+
+    it('keeps provenance-only releases visible but rejects mutable duplicate versions', function () {
+        const v1 = executableRelease({ version: '1.1.0' });
+        const v2 = executableRelease({ version: '1.2.0' });
+        const catalog = clone(v2.catalog);
+        const provenanceOnly = clone(v1.catalog.entries[0]);
+        provenanceOnly.installable = false;
+        provenanceOnly.distribution = 'store';
+        provenanceOnly.manifest.kind = 'trusted-official';
+        provenanceOnly.manifest.distribution = 'store';
+        provenanceOnly.releasedAt = '2026-08-10T01:00:00.000Z';
+        catalog.entries[0].releases = [
+            clone(v2.catalog.entries[0]),
+            provenanceOnly,
+        ];
+
+        const normalized = normalizeCommunityCatalog(
+            catalog,
+            v2.sourceUrl,
+            'source-history',
+        );
+        expect(normalized.entries[0].releases[1]).to.include({
+            version: '1.1.0',
+            installable: false,
+            distribution: 'store',
+        });
+
+        const mutated = clone(catalog);
+        mutated.entries[0].releases[0].packageDigest = '0'.repeat(64);
+        mutated.entries[0].releases[0].packageDigests.node = '0'.repeat(64);
+        expect(() =>
+            normalizeCommunityCatalog(mutated, v2.sourceUrl, 'source-history'),
+        ).to.throw('immutable content');
+
+        const installabilityDrift = clone(catalog);
+        installabilityDrift.entries[0].releases = [
+            clone(v2.catalog.entries[0]),
+            { ...clone(v2.catalog.entries[0]), installable: false },
+            provenanceOnly,
+        ];
+        expect(() =>
+            normalizeCommunityCatalog(
+                installabilityDrift,
+                v2.sourceUrl,
+                'source-history',
+            ),
+        ).to.throw('immutable content');
+    });
+
     it('normalizes GitHub blob links and rejects URL credentials/private HTTP', function () {
         expect(
             normalizeExtensionSourceUrl(
@@ -880,12 +972,12 @@ describe('Community extension sources', function () {
                     ),
             });
 
-            expect(
-                manager.getAvailability(EXECUTABLE_EXTENSION_ID),
-            ).to.include({
-                status: 'reinstall-required',
-                retainedReason: 'user-uninstalled',
-            });
+            expect(manager.getAvailability(EXECUTABLE_EXTENSION_ID)).to.include(
+                {
+                    status: 'reinstall-required',
+                    retainedReason: 'user-uninstalled',
+                },
+            );
 
             const source = await manager.addSource({
                 url: repository.sourceUrl,
@@ -1203,6 +1295,193 @@ module.exports = Object.freeze({
         }
     });
 
+    it('installs, downgrades, upgrades, and reinstalls exact remote release versions', async function () {
+        const v1 = executableRelease({ version: '1.1.0' });
+        const v2 = executableRelease({ version: '1.2.0' });
+        const v3 = executableRelease({ version: '1.3.0' });
+        let activeCatalog = clone(v3.catalog);
+        activeCatalog.entries[0].releases = [v3, v2, v1].map(
+            (release, index) => ({
+                ...clone(release.catalog.entries[0]),
+                releasedAt: `2026-08-${12 - index}T01:00:00.000Z`,
+                gitTag: `${EXECUTABLE_EXTENSION_ID}@${release.packageDocument.manifest.version}`,
+            }),
+        );
+        const packages = new Map(
+            [v1, v2, v3].map((release) => [
+                release.packageUrl,
+                release.packageDocument,
+            ]),
+        );
+        const basePath = fs.mkdtempSync(
+            path.join(os.tmpdir(), 'sub-store-remote-release-selection-'),
+        );
+        try {
+            const manager = new ExtensionManager({
+                store: createStore(undefined),
+                env: { isNode: true },
+                packageStore: createNodeExtensionPackageStore({ basePath }),
+                sourceFetcher: async (url) =>
+                    response(
+                        url === v3.sourceUrl
+                            ? activeCatalog
+                            : packages.get(url),
+                    ),
+            });
+            await manager.addSource({ url: v3.sourceUrl });
+
+            expect(manager.findEntry(EXECUTABLE_EXTENSION_ID)).to.include({
+                version: '1.3.0',
+            });
+            expect(
+                manager.findEntry(EXECUTABLE_EXTENSION_ID, {
+                    version: '1.2.0',
+                }),
+            ).to.include({ version: '1.2.0' });
+            expect(
+                manager
+                    .getCatalog()
+                    .entries.find(
+                        (entry) => entry.id === EXECUTABLE_EXTENSION_ID,
+                    )
+                    .releases.map((release) => release.version),
+            ).to.deep.equal(['1.3.0', '1.2.0', '1.1.0']);
+
+            const { app, handlers } = createRouteApp();
+            registerExtensionControlRoutes(app, manager);
+            const installResponse = createApiResponse();
+            await handlers.get('POST /api/admin/extensions/:id/install')(
+                {
+                    params: { id: EXECUTABLE_EXTENSION_ID },
+                    body: { version: '1.2.0' },
+                    headers: {},
+                    extensionAdmin: true,
+                },
+                installResponse,
+            );
+            expect(installResponse.statusCode).to.equal(201);
+            expect(installResponse.body.data.record.version).to.equal('1.2.0');
+
+            manager.enable(EXECUTABLE_EXTENSION_ID);
+
+            const downgraded = await manager.update(EXECUTABLE_EXTENSION_ID, {
+                version: '1.1.0',
+            });
+            expect(downgraded).to.include({ status: 'updated-enabled' });
+            expect(downgraded.record).to.include({
+                version: '1.1.0',
+                enabled: true,
+            });
+
+            const upgraded = await manager.update(EXECUTABLE_EXTENSION_ID);
+            expect(upgraded.record).to.include({
+                version: '1.3.0',
+                enabled: true,
+            });
+
+            activeCatalog = clone(v2.catalog);
+            activeCatalog.entries[0].releases = [
+                clone(v2.catalog.entries[0]),
+                clone(v1.catalog.entries[0]),
+            ];
+            const noDowngrade = await manager.update(EXECUTABLE_EXTENSION_ID);
+            expect(noDowngrade).to.include({ status: 'current', noOp: true });
+            expect(noDowngrade.record.version).to.equal('1.3.0');
+
+            manager.disable(EXECUTABLE_EXTENSION_ID);
+            manager.uninstall(EXECUTABLE_EXTENSION_ID);
+            const reinstalled = await manager.installFromSource(
+                EXECUTABLE_EXTENSION_ID,
+                { version: '1.2.0' },
+            );
+            expect(reinstalled.record.version).to.equal('1.2.0');
+        } finally {
+            fs.rmSync(basePath, { recursive: true, force: true });
+        }
+    });
+
+    it('does not install provenance-only releases and guards storage schema downgrades', async function () {
+        const v1 = executableRelease({
+            version: '1.1.0',
+            storageSchemaVersion: 1,
+        });
+        const v2 = executableRelease({
+            version: '1.2.0',
+            storageSchemaVersion: 2,
+        });
+        const catalog = clone(v2.catalog);
+        catalog.entries[0].releases = [
+            clone(v2.catalog.entries[0]),
+            { ...clone(v1.catalog.entries[0]), installable: false },
+        ];
+        const packages = new Map([
+            [v1.packageUrl, v1.packageDocument],
+            [v2.packageUrl, v2.packageDocument],
+        ]);
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async (url) =>
+                response(url === v2.sourceUrl ? catalog : packages.get(url)),
+        });
+        await manager.addSource({ url: v2.sourceUrl });
+        expect(
+            manager.findEntry(EXECUTABLE_EXTENSION_ID, {
+                version: '1.1.0',
+            }),
+        ).to.equal(null);
+        let unavailableError;
+        try {
+            await manager.installFromSource(EXECUTABLE_EXTENSION_ID, {
+                version: '1.1.0',
+            });
+        } catch (error) {
+            unavailableError = error;
+        }
+        expect(unavailableError).to.have.property(
+            'code',
+            'EXTENSION_VERSION_UNAVAILABLE',
+        );
+
+        const installableCatalog = clone(v2.catalog);
+        installableCatalog.entries[0].releases = [
+            clone(v2.catalog.entries[0]),
+            clone(v1.catalog.entries[0]),
+        ];
+        const schemaManager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async (url) =>
+                response(
+                    url === v2.sourceUrl
+                        ? installableCatalog
+                        : packages.get(url),
+                ),
+        });
+        await schemaManager.addSource({ url: v2.sourceUrl });
+        await schemaManager.installFromSource(EXECUTABLE_EXTENSION_ID);
+        let schemaError;
+        try {
+            await schemaManager.update(EXECUTABLE_EXTENSION_ID, {
+                version: '1.1.0',
+            });
+        } catch (error) {
+            schemaError = error;
+        }
+        expect(schemaError).to.have.property(
+            'code',
+            'EXTENSION_STORAGE_SCHEMA_DOWNGRADE_FORBIDDEN',
+        );
+        expect(schemaError.details).to.include({
+            installedVersion: '1.2.0',
+            targetVersion: '1.1.0',
+            installedStorageSchemaVersion: 2,
+            targetStorageSchemaVersion: 1,
+        });
+    });
+
     it('keeps only three verified rollback packages and removes the pruned version from disk', async function () {
         const repository = executableRelease();
         const releases = ['1.2.0', '1.3.0', '1.4.0', '1.5.0'].map((version) =>
@@ -1350,6 +1629,69 @@ module.exports = Object.freeze({
         expect(manager.getSources()[0].entries[0].packageDigests.node).to.equal(
             fixture.packageDigest,
         );
+    });
+
+    it('rejects installability and package URL drift for historical releases during refresh', async function () {
+        const v1 = executableRelease({ version: '1.1.0' });
+        const v2 = executableRelease({ version: '1.2.0' });
+        const sourceUrl = v2.sourceUrl;
+        let activeCatalog = clone(v2.catalog);
+        activeCatalog.entries[0].releases = [
+            clone(v2.catalog.entries[0]),
+            { ...clone(v1.catalog.entries[0]), installable: false },
+        ];
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async () => response(activeCatalog),
+        });
+        const source = await manager.addSource({ url: sourceUrl });
+        const originalRelease = manager
+            .getSources()[0]
+            .entries[0].releases.find((release) => release.version === '1.1.0');
+
+        activeCatalog = clone(activeCatalog);
+        activeCatalog.entries[0].releases[1].installable = true;
+        let installabilityError;
+        try {
+            await manager.refreshSource(source.id);
+        } catch (error) {
+            installabilityError = error;
+        }
+        expect(installabilityError).to.have.property(
+            'code',
+            'EXTENSION_SOURCE_VERSION_MUTATED',
+        );
+
+        activeCatalog = clone(v2.catalog);
+        activeCatalog.entries[0].releases = [
+            clone(v2.catalog.entries[0]),
+            {
+                ...clone(v1.catalog.entries[0]),
+                installable: false,
+                packageUrls: {
+                    node: 'https://example.test/extensions/moved-1.1.0.json',
+                },
+            },
+        ];
+        let urlError;
+        try {
+            await manager.refreshSource(source.id);
+        } catch (error) {
+            urlError = error;
+        }
+        expect(urlError).to.have.property(
+            'code',
+            'EXTENSION_SOURCE_VERSION_MUTATED',
+        );
+        expect(
+            manager
+                .getSources()[0]
+                .entries[0].releases.find(
+                    (release) => release.version === '1.1.0',
+                ),
+        ).to.deep.equal(originalRelease);
     });
 
     it('rejects executable source digest drift and package tampering', async function () {

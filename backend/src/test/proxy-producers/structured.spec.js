@@ -278,6 +278,56 @@ describe('Proxy structured producers', function () {
         });
     });
 
+    it('filters malformed VMess and VLESS UUIDs even when unsupported Clash proxies are included', function () {
+        const proxies = [
+            {
+                type: 'vmess',
+                name: 'Valid VMess',
+                server: 'valid.example.com',
+                port: 443,
+                uuid: UUID,
+                cipher: 'auto',
+                alterId: 0,
+            },
+            {
+                type: 'vmess',
+                name: 'Malformed VMess',
+                server: 'invalid-vmess.example.com',
+                port: 443,
+                uuid: 'deadbeef',
+                cipher: 'auto',
+                alterId: 0,
+            },
+            {
+                type: 'vless',
+                name: 'Malformed VLESS',
+                server: 'invalid-vless.example.com',
+                port: 443,
+                uuid: '12345678',
+            },
+        ];
+
+        for (const opts of [
+            {},
+            { 'include-unsupported-proxy': true },
+        ]) {
+            const { result, errors } = captureErrors(() =>
+                produceInternal('Clash', proxies, opts),
+            );
+
+            expect(result.map((proxy) => proxy.name)).to.deep.equal([
+                'Valid VMess',
+            ]);
+            expect(errors).to.have.length(2);
+            expect(errors[0]).to.include(
+                'Skipping VMess proxy Malformed VMess: invalid UUID',
+            );
+            expect(errors[1]).to.include(
+                'Skipping VLESS proxy Malformed VLESS: invalid UUID',
+            );
+        }
+    });
+
     it('keeps only websocket shadowsocks v2ray-plugin modes for Mihomo and Stash by default', function () {
         const buildProxy = (name, mode) => ({
             type: 'ss',

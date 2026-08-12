@@ -45,6 +45,7 @@ import {
     SOURCE_EXECUTABLE_DISTRIBUTION,
 } from './sources';
 import { version as packageVersion } from '../../package.json';
+import { compare as compareSemver, valid as validSemver } from 'semver';
 
 const STATE_SCHEMA_VERSION = 1;
 const MAX_TASKS = 100;
@@ -187,20 +188,10 @@ function verificationMode(result) {
     return 'unverified';
 }
 
-function parseVersion(value) {
-    const match = `${value || ''}`.match(/^(\d+)\.(\d+)\.(\d+)/);
-    return match ? match.slice(1).map(Number) : null;
-}
-
 function compareVersions(left, right) {
-    const a = parseVersion(left);
-    const b = parseVersion(right);
-    if (!a || !b) return null;
-    for (let index = 0; index < 3; index += 1) {
-        if (a[index] > b[index]) return 1;
-        if (a[index] < b[index]) return -1;
-    }
-    return 0;
+    const a = validSemver(`${left || ''}`);
+    const b = validSemver(`${right || ''}`);
+    return a && b ? compareSemver(a, b) : null;
 }
 
 function satisfiesVersionConstraint(current, constraint) {
@@ -646,14 +637,54 @@ function preferCatalogEntry(current, candidate) {
     return current;
 }
 
+function catalogReleaseEntries(entry, { includeNonInstallable = false } = {}) {
+    if (!entry) return [];
+    const manifest = entry.manifest || entry;
+    const releases =
+        Array.isArray(entry.releases) && entry.releases.length
+            ? entry.releases
+            : [entry];
+    const byVersion = new Map();
+    for (const candidate of releases) {
+        const candidateManifest = candidate?.manifest || candidate;
+        if (
+            candidateManifest?.id !== manifest?.id ||
+            !candidateManifest?.version ||
+            (!includeNonInstallable && candidate.installable === false)
+        ) {
+            continue;
+        }
+        byVersion.set(candidateManifest.version, candidate);
+    }
+    if (!byVersion.has(manifest?.version))
+        byVersion.set(manifest.version, entry);
+    return [...byVersion.values()];
+}
+
+function catalogRelease(entry, version, options) {
+    if (!version) return entry;
+    return (
+        catalogReleaseEntries(entry, options).find(
+            (candidate) =>
+                (candidate.manifest || candidate).version === version,
+        ) || null
+    );
+}
+
+function sourceVersionEntries(entries) {
+    return (entries || []).flatMap((entry) =>
+        catalogReleaseEntries(entry, { includeNonInstallable: true }),
+    );
+}
+
 function assertImmutableSourceVersions(previousEntries, nextEntries) {
     const previousByVersion = new Map(
-        (previousEntries || []).map((entry) => [
+        sourceVersionEntries(previousEntries).map((entry) => [
             catalogEntryKey(entry.id, entry.version),
             entry,
         ]),
     );
-    for (const nextEntry of nextEntries || []) {
+    for (const nextEntry of sourceVersionEntries(nextEntries)) {
         const previousEntry = previousByVersion.get(
             catalogEntryKey(nextEntry.id, nextEntry.version),
         );
@@ -674,10 +705,24 @@ function assertImmutableSourceVersions(previousEntries, nextEntries) {
                     normalizeExtensionManifest(nextEntry.manifest || nextEntry),
                 ),
             );
+        const immutableProjection = (entry, manifestDigest) => ({
+            manifestDigest,
+            distribution: entry.distribution || null,
+            selectedVariant: entry.selectedVariant || null,
+            installable: entry.installable !== false,
+            packageUrls: entry.packageUrls || {},
+            packageDigests: entry.packageDigests || {},
+        });
+        const previousProjection = immutableProjection(
+            previousEntry,
+            previousManifestDigest,
+        );
+        const nextProjection = immutableProjection(
+            nextEntry,
+            nextManifestDigest,
+        );
         if (
-            previousManifestDigest !== nextManifestDigest ||
-            canonicalJson(previousEntry.packageDigests || {}) !==
-                canonicalJson(nextEntry.packageDigests || {})
+            canonicalJson(previousProjection) !== canonicalJson(nextProjection)
         ) {
             throw errorWithCode(
                 'EXTENSION_SOURCE_VERSION_MUTATED',
@@ -691,6 +736,8 @@ function assertImmutableSourceVersions(previousEntries, nextEntries) {
                         previousEntry.packageDigests || {},
                     ),
                     nextPackageDigests: clone(nextEntry.packageDigests || {}),
+                    previousImmutableProjection: clone(previousProjection),
+                    nextImmutableProjection: clone(nextProjection),
                 },
             );
         }
@@ -968,7 +1015,7 @@ export class ExtensionManager {
         return normalized;
     }
 
-    findEntry(extensionId) {
+    findEntry(extensionId, { version } = {}) {
         const canonicalId = this.resolveId(extensionId);
         const state = this.readState();
         const builtInEntries = [
@@ -983,14 +1030,25 @@ export class ExtensionManager {
         );
         const sourceEntries = Object.values(state.sources || {}).flatMap(
             (source) =>
-                (source.entries || []).filter(
-                    (candidate) => candidate.id === canonicalId,
-                ),
+                (source.entries || [])
+                    .filter((candidate) => candidate.id === canonicalId)
+                    .map((candidate) => catalogRelease(candidate, version))
+                    .filter(Boolean),
         );
+        const versionedBuiltInEntries = version
+            ? builtInEntries
+                  .map((candidate) => catalogRelease(candidate, version))
+                  .filter(Boolean)
+            : builtInEntries;
         const selected = [...builtInEntries, ...sourceEntries].reduce(
             preferCatalogEntry,
             null,
         );
+        const versionedSelected = [
+            ...versionedBuiltInEntries,
+            ...sourceEntries,
+        ].reduce(preferCatalogEntry, null);
+        if (version) return versionedSelected ? clone(versionedSelected) : null;
         if (selected) return clone(selected);
         const retained = state.installed?.[canonicalId];
         if (
@@ -1526,6 +1584,38 @@ export class ExtensionManager {
                 : null;
             const latestEntry = latestById.get(manifest.id);
             const latestManifest = catalogManifest(latestEntry);
+            const releases = catalogReleaseEntries(entry, {
+                includeNonInstallable: true,
+            })
+                .sort(
+                    (left, right) =>
+                        compareVersions(
+                            (right.manifest || right).version,
+                            (left.manifest || left).version,
+                        ) || 0,
+                )
+                .map((release) => {
+                    const releaseManifest = normalizeExtensionManifest(
+                        release.manifest || release,
+                    );
+                    return {
+                        version: releaseManifest.version,
+                        manifest: clone(releaseManifest),
+                        distribution:
+                            release.distribution ||
+                            releaseManifest.distribution ||
+                            'community',
+                        selectedVariant: release.selectedVariant || null,
+                        packageUrls: clone(release.packageUrls || {}),
+                        packageDigests: clone(release.packageDigests || {}),
+                        installable: release.installable !== false,
+                        releasedAt: release.releasedAt || null,
+                        gitTag: release.gitTag || null,
+                        gitCommit: release.gitCommit || null,
+                        latest:
+                            releaseManifest.version === latestManifest?.version,
+                    };
+                });
             return {
                 ...clone(manifest),
                 id: manifest.id,
@@ -1555,6 +1645,7 @@ export class ExtensionManager {
                 rollbackVersions: verifiedRollbackHistory(record).map(
                     (snapshot) => snapshot.version,
                 ),
+                releases,
                 latest:
                     latestManifest?.version === manifest.version &&
                     latestManifest?.id === manifest.id,
@@ -2746,16 +2837,30 @@ export class ExtensionManager {
 
     async installFromSource(extensionId, input = {}) {
         const canonicalId = this.resolveId(extensionId);
-        const entry = input.catalogEntry || this.findEntry(canonicalId);
+        const entry =
+            input.catalogEntry ||
+            this.findEntry(canonicalId, { version: input.version });
         const communityPackage = entry?.distribution === 'community';
         const sourceExecutable =
             entry?.distribution === SOURCE_EXECUTABLE_DISTRIBUTION;
         if (!entry) {
-            const error = errorWithCode(
-                'EXTENSION_SOURCE_NOT_FOUND',
-                `Extension ${canonicalId} is not present in an installed source`,
-                { extensionId: canonicalId, sourceId: null },
-            );
+            const latest = this.findEntry(canonicalId);
+            const error = input.version
+                ? errorWithCode(
+                      'EXTENSION_VERSION_UNAVAILABLE',
+                      `Requested extension version ${input.version} is unavailable`,
+                      {
+                          extensionId: canonicalId,
+                          requestedVersion: input.version,
+                          availableVersion:
+                              (latest?.manifest || latest)?.version || null,
+                      },
+                  )
+                : errorWithCode(
+                      'EXTENSION_SOURCE_NOT_FOUND',
+                      `Extension ${canonicalId} is not present in an installed source`,
+                      { extensionId: canonicalId, sourceId: null },
+                  );
             error.statusCode = 404;
             throw error;
         }
@@ -2804,7 +2909,9 @@ export class ExtensionManager {
     }
 
     _verifyLocalPackage(extensionId, input = {}) {
-        const catalogEntry = input.catalogEntry || this.findEntry(extensionId);
+        const catalogEntry =
+            input.catalogEntry ||
+            this.findEntry(extensionId, { version: input.version });
         const packageInput = input.package;
         const sourceExecutable =
             input.source === SOURCE_EXECUTABLE_DISTRIBUTION &&
@@ -2863,9 +2970,7 @@ export class ExtensionManager {
                 { cause: error.message },
             );
         }
-        if (
-            canonicalJson(packageManifest) !== canonicalJson(manifest)
-        ) {
+        if (canonicalJson(packageManifest) !== canonicalJson(manifest)) {
             throw errorWithCode(
                 'EXTENSION_PACKAGE_MANIFEST_MISMATCH',
                 'Package manifest does not match the catalog entry after normalization',
@@ -3135,7 +3240,9 @@ export class ExtensionManager {
 
     install(extensionId, input = {}) {
         const canonicalId = this.resolveId(extensionId);
-        const catalogEntry = input.catalogEntry || this.findEntry(canonicalId);
+        const catalogEntry =
+            input.catalogEntry ||
+            this.findEntry(canonicalId, { version: input.version });
         if (!catalogEntry && !input.package) {
             const error = errorWithCode(
                 'EXTENSION_SOURCE_NOT_FOUND',
@@ -3204,10 +3311,10 @@ export class ExtensionManager {
                     },
                 );
             }
-            if (versionComparison < 0) {
+            if (versionComparison < 0 && input.allowDowngrade !== true) {
                 throw errorWithCode(
                     'EXTENSION_VERSION_DOWNGRADE_FORBIDDEN',
-                    'Use the rollback operation to restore an older extension version',
+                    'Select an explicit remote version or use local rollback to restore an older extension version',
                     {
                         installedVersion: previous.version,
                         packageVersion: verified.manifest.version,
@@ -3863,10 +3970,27 @@ export class ExtensionManager {
         });
         const refreshedState = this.readState();
         const source = refreshedState.sources?.[sourceId];
-        const catalogEntry = (source?.entries || [])
+        const sourceCatalogEntry = (source?.entries || [])
             .filter((entry) => entry.id === canonicalId)
             .reduce(preferCatalogEntry, null);
+        const catalogEntry = input.version
+            ? catalogRelease(sourceCatalogEntry, input.version)
+            : sourceCatalogEntry;
         if (!catalogEntry || source?.verified !== true) {
+            if (input.version && sourceCatalogEntry) {
+                throw errorWithCode(
+                    'EXTENSION_VERSION_UNAVAILABLE',
+                    `Requested extension version ${input.version} is unavailable`,
+                    {
+                        extensionId: canonicalId,
+                        sourceId,
+                        requestedVersion: input.version,
+                        availableVersion: (
+                            sourceCatalogEntry.manifest || sourceCatalogEntry
+                        ).version,
+                    },
+                );
+            }
             throw errorWithCode(
                 'EXTENSION_SOURCE_NOT_FOUND',
                 `Extension ${canonicalId} is no longer available from its source`,
@@ -3900,7 +4024,32 @@ export class ExtensionManager {
                 },
             );
         }
-        if (comparison <= 0) {
+        if (comparison < 0 && input.version) {
+            const installedStorageSchemaVersion = Number(
+                before.manifestSnapshot?.storage?.schemaVersion,
+            );
+            const targetStorageSchemaVersion = Number(
+                availableManifest.storage?.schemaVersion,
+            );
+            if (
+                Number.isInteger(installedStorageSchemaVersion) &&
+                Number.isInteger(targetStorageSchemaVersion) &&
+                targetStorageSchemaVersion < installedStorageSchemaVersion
+            ) {
+                throw errorWithCode(
+                    'EXTENSION_STORAGE_SCHEMA_DOWNGRADE_FORBIDDEN',
+                    'The selected extension version declares an older storage schema and cannot safely read current data',
+                    {
+                        extensionId: canonicalId,
+                        installedVersion: before.version,
+                        targetVersion: availableManifest.version,
+                        installedStorageSchemaVersion,
+                        targetStorageSchemaVersion,
+                    },
+                );
+            }
+        }
+        if (comparison === 0 || (comparison < 0 && !input.version)) {
             let noOpResult;
             this._commit(
                 (state) => {
@@ -3939,6 +4088,7 @@ export class ExtensionManager {
 
         const installed = await this.installFromSource(canonicalId, {
             ...input,
+            allowDowngrade: comparison < 0 && Boolean(input.version),
             expectedRevision: refreshedState.revision,
             taskAction: 'update',
             catalogEntry,

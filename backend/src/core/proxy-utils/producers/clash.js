@@ -2,6 +2,7 @@ import {
     isPresent,
     produceProxyListOutput,
 } from '@/core/proxy-utils/producers/utils';
+import { isValidUUID } from '@/utils';
 import { normalizeClashVmessSecurity } from '../vmess-security';
 import {
     deleteHttpUpgradeEarlyDataMetadata,
@@ -19,6 +20,19 @@ export default function Clash_Producer() {
         // https://clash.wiki/configuration/outbound.html#shadowsocks
         const list = proxies
             .filter((proxy) => {
+                if (
+                    ['vmess', 'vless'].includes(proxy.type) &&
+                    !isValidUUID(proxy.uuid)
+                ) {
+                    const proxyType =
+                        proxy.type === 'vmess' ? 'VMess' : 'VLESS';
+                    $.error(
+                        `Skipping ${proxyType} proxy ${
+                            proxy.name || `${proxy.server}:${proxy.port}`
+                        }: invalid UUID`,
+                    );
+                    return false;
+                }
                 if (opts['include-unsupported-proxy']) return true;
                 if (
                     ![
