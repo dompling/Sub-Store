@@ -1657,6 +1657,8 @@ export class ExtensionManager {
         return {
             schemaVersion: this.catalogEnvelope?.payload?.schemaVersion || 1,
             sequence: this.catalogEnvelope?.payload?.sequence || 0,
+            storageIdentity: this.storageIdentity,
+            revision: state.revision,
             channel: this.catalogEnvelope?.payload?.channel || 'stable',
             expiresAt: this.catalogEnvelope?.expiresAt || null,
             verified: this.catalogVerification.valid && catalogClosed,

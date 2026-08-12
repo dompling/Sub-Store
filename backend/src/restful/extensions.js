@@ -163,8 +163,13 @@ function handle(res, action, successStatus = 200) {
 
 function setEtag(res, value) {
     const etag = `W/"extensions-${value}"`;
-    if (typeof res.set === 'function') res.set('ETag', etag);
-    else if (typeof res.header === 'function') res.header('ETag', etag);
+    if (typeof res.set === 'function') {
+        res.set('ETag', etag);
+        res.set('Cache-Control', 'no-cache');
+    } else if (typeof res.header === 'function') {
+        res.header('ETag', etag);
+        res.header('Cache-Control', 'no-cache');
+    }
     return etag;
 }
 
@@ -201,7 +206,10 @@ export function registerExtensionControlRoutes(
 
     $app.get('/api/extensions/catalog', (req, res) => {
         const catalog = manager.getCatalog();
-        const etag = setEtag(res, catalog.sequence);
+        const etag = setEtag(
+            res,
+            `${catalog.storageIdentity}-${catalog.revision}-catalog-${catalog.sequence}`,
+        );
         if (notModified(req, res, etag)) return;
         success(res, catalog);
     });

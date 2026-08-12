@@ -683,6 +683,20 @@ describe('Extension Host foundation', function () {
             expect(
                 catalogResponse.body.data.entries.map((item) => item.id),
             ).to.not.include(GENERIC_REMOTE_EXTENSION_ID);
+            const initialCatalogEtag = catalogResponse.headers.ETag;
+            expect(initialCatalogEtag).to.equal(
+                `W/"extensions-${catalogResponse.body.data.storageIdentity}-${catalogResponse.body.data.revision}-catalog-${catalogResponse.body.data.sequence}"`,
+            );
+            expect(catalogResponse.headers['Cache-Control']).to.equal(
+                'no-cache',
+            );
+
+            const unchangedCatalogResponse = createResponse();
+            await handlers.get('GET /api/extensions/catalog')(
+                { headers: { 'if-none-match': initialCatalogEtag } },
+                unchangedCatalogResponse,
+            );
+            expect(unchangedCatalogResponse.statusCode).to.equal(304);
 
             const sourcesResponse = createResponse();
             await handlers.get('GET /api/extensions/sources')(
@@ -704,6 +718,19 @@ describe('Extension Host foundation', function () {
             expect(installResponse.statusCode).to.equal(201);
             expect(installResponse.body.data.status).to.equal(
                 'installed-disabled',
+            );
+
+            const changedCatalogResponse = createResponse();
+            await handlers.get('GET /api/extensions/catalog')(
+                { headers: { 'if-none-match': initialCatalogEtag } },
+                changedCatalogResponse,
+            );
+            expect(changedCatalogResponse.statusCode).to.equal(200);
+            expect(changedCatalogResponse.headers.ETag).to.not.equal(
+                initialCatalogEtag,
+            );
+            expect(changedCatalogResponse.body.data.revision).to.be.greaterThan(
+                catalogResponse.body.data.revision,
             );
 
             const missingSourceInstallResponse = createResponse();
