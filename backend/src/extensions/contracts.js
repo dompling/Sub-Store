@@ -87,6 +87,10 @@ function isNonEmptyString(value) {
 
 function validateContributionIds(manifest) {
     const contributions = manifest.contributes || {};
+    const artifactSourceIds = new Set();
+    const requiresResourceBroker = (manifest.requires?.hard || []).includes(
+        'resource-broker@1',
+    );
     for (const field of [
         'routes',
         'navigation',
@@ -96,6 +100,7 @@ function validateContributionIds(manifest) {
         'scheduledCommands',
         'archiveTypes',
         'features',
+        'artifactSources',
     ]) {
         for (const contribution of contributions[field] || []) {
             const id =
@@ -109,6 +114,60 @@ function validateContributionIds(manifest) {
                 `Contribution ${field} must be namespaced by ${manifest.id}`,
                 { field, id, extensionId: manifest.id },
             );
+            if (field === 'artifactSources') {
+                assert(
+                    !artifactSourceIds.has(id),
+                    `Contribution artifactSources contains duplicate id ${id}`,
+                    { field, id, extensionId: manifest.id },
+                );
+                artifactSourceIds.add(id);
+                assert(
+                    contribution && typeof contribution === 'object',
+                    'Artifact source contribution must be an object',
+                    { id, extensionId: manifest.id },
+                );
+                assert(
+                    isNonEmptyString(contribution.type),
+                    `Artifact source ${id} type is required`,
+                    { id, extensionId: manifest.id },
+                );
+                if (contribution.contract != null) {
+                    assert(
+                        isNonEmptyString(contribution.contract) &&
+                            /^[A-Za-z0-9][A-Za-z0-9._-]*@[1-9][0-9]*$/.test(
+                                contribution.contract,
+                            ),
+                        `Artifact source ${id} contract is invalid`,
+                        { id, extensionId: manifest.id },
+                    );
+                }
+                if (contribution.representations != null) {
+                    assert(
+                        Array.isArray(contribution.representations) &&
+                            contribution.representations.length > 0 &&
+                            contribution.representations.every(
+                                isNonEmptyString,
+                            ) &&
+                            new Set(contribution.representations).size ===
+                                contribution.representations.length,
+                        `Artifact source ${id} representations are invalid`,
+                        { id, extensionId: manifest.id },
+                    );
+                }
+                if (requiresResourceBroker) {
+                    assert(
+                        isNonEmptyString(contribution.contract),
+                        `Artifact source ${id} contract is required by resource-broker@1`,
+                        { id, extensionId: manifest.id },
+                    );
+                    assert(
+                        Array.isArray(contribution.representations) &&
+                            contribution.representations.length > 0,
+                        `Artifact source ${id} representations are required by resource-broker@1`,
+                        { id, extensionId: manifest.id },
+                    );
+                }
+            }
         }
     }
 }
@@ -285,6 +344,7 @@ export function listManifestContributionIds(manifest) {
         'scheduledCommands',
         'archiveTypes',
         'features',
+        'artifactSources',
     ]) {
         for (const item of normalized.contributes[field] || []) {
             result.push(typeof item === 'string' ? item : item.id);

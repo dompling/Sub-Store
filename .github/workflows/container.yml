@@ -1,0 +1,206 @@
+name: container
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Push the image to GitHub Container Registry
+        required: true
+        default: false
+        type: boolean
+  # main.yml creates release tags with GITHUB_TOKEN. GitHub suppresses push
+  # workflows caused by that token, so follow the successful release workflow
+  # explicitly to publish the matching semantic-version image.
+  workflow_run:
+    workflows:
+      - build
+    types:
+      - completed
+    branches:
+      - master
+  push:
+    branches:
+      - master
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+    paths:
+      - 'backend/**'
+      # Package-version-only branch pushes publish after the release job.
+      # GitHub does not apply path filters to tag pushes.
+      - '!backend/package.json'
+      - '.node-version'
+      - '.github/workflows/container.yml'
+  pull_request:
+    paths:
+      - 'backend/**'
+      - '.node-version'
+      - '.github/workflows/container.yml'
+
+concurrency:
+  group: container-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/sub-store
+
+jobs:
+  test:
+    if: github.event_name != 'workflow_run'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: '.node-version'
+
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+
+      - name: Test
+        working-directory: backend
+        run: pnpm test
+
+  container:
+    needs: test
+    if: ${{ always() && (needs.test.result == 'success' || needs.test.result == 'skipped') && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Resolve build metadata
+        id: build
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
+          PUBLISH_REQUESTED: ${{ inputs.publish }}
+          SOURCE_BRANCH: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref_name }}
+          SOURCE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          version="$(node --eval="process.stdout.write(require('./backend/package.json').version)")"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unsupported backend version: $version" >&2
+            exit 1
+          fi
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "Invalid source commit: $SOURCE_SHA" >&2
+            exit 1
+          fi
+
+          release=false
+          if [ "$IS_TAG" = "true" ] || [ "$GITHUB_EVENT_NAME" = "workflow_run" ]; then
+            release=true
+          fi
+
+          rolling=false
+          if [ "$IS_TAG" != "true" ] && [ "$SOURCE_BRANCH" = "$DEFAULT_BRANCH" ]; then
+            rolling=true
+          fi
+
+          push=false
+          if [ "$GITHUB_EVENT_NAME" = "push" ] \
+            || [ "$GITHUB_EVENT_NAME" = "workflow_run" ] \
+            || [ "$PUBLISH_REQUESTED" = "true" ]; then
+            push=true
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SOURCE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SOURCE_SHA:0:12}" >> "$GITHUB_OUTPUT"
+          echo "release=${release}" >> "$GITHUB_OUTPUT"
+          echo "rolling=${rolling}" >> "$GITHUB_OUTPUT"
+          echo "push=${push}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify version tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          PACKAGE_VERSION: ${{ steps.build.outputs.version }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          normalized_tag="${RELEASE_TAG#v}"
+          if [ "$normalized_tag" != "$PACKAGE_VERSION" ]; then
+            echo "Tag $RELEASE_TAG does not match backend version $PACKAGE_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Verify release source
+        if: github.event_name == 'workflow_run'
+        shell: bash
+        env:
+          PACKAGE_VERSION: ${{ steps.build.outputs.version }}
+          SOURCE_SHA: ${{ steps.build.outputs.sha }}
+        run: |
+          tag_sha="$(git rev-list -n 1 "refs/tags/${PACKAGE_VERSION}" 2>/dev/null || true)"
+          if [ -z "$tag_sha" ]; then
+            echo "Release workflow did not create tag $PACKAGE_VERSION" >&2
+            exit 1
+          fi
+          if [ "$tag_sha" != "$SOURCE_SHA" ]; then
+            echo "Tag $PACKAGE_VERSION points to $tag_sha, expected $SOURCE_SHA" >&2
+            exit 1
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=raw,value=${{ github.ref_name }},enable=${{ github.event_name == 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/') }}
+            type=raw,value=${{ github.event.workflow_run.head_branch }},enable=${{ github.event_name == 'workflow_run' }}
+            type=semver,pattern={{version}},value=${{ steps.build.outputs.version }},enable=${{ steps.build.outputs.release == 'true' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.build.outputs.version }},enable=${{ steps.build.outputs.release == 'true' }}
+            type=raw,value=sha-${{ steps.build.outputs.short_sha }}
+            type=raw,value=latest,enable=${{ steps.build.outputs.rolling == 'true' }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.build.outputs.sha }}
+          flavor: |
+            latest=false
+
+      - name: Log in to GitHub Container Registry
+        if: steps.build.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish container
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          pull: true
+          push: ${{ steps.build.outputs.push == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=container-${{ github.event_name == 'pull_request' && 'pr' || 'trusted' }}
+          cache-to: type=gha,mode=max,scope=container-${{ github.event_name == 'pull_request' && 'pr' || 'trusted' }}

@@ -1,10 +1,15 @@
-import { getExtensionManager } from './manager';
+import { extensionHostCapabilities, getExtensionManager } from './manager';
 import { listRegisteredExtensions } from './registry';
 import { createExtensionGateway } from './gateway';
 import configHostingManifest from './config-hosting/manifest.json';
 import { createConfigHostingAdapter } from './config-hosting';
 import { createBackendExtensionSdkV1 } from './backend-sdk-v1';
 import { registerExtension, unregisterExtension } from './registry';
+import { createExtensionReferenceIndex } from './reference-index';
+import {
+    createResourceBroker,
+    setDefaultResourceBroker,
+} from './resource-broker';
 
 /**
  * Initialize the data-only Host layer. Business extensions can continue to
@@ -12,11 +17,40 @@ import { registerExtension, unregisterExtension } from './registry';
  * manifest/manager/gateway boundary for incremental migration.
  */
 export function initializeExtensionHost(options = {}) {
-    const manager = getExtensionManager(options);
+    const hasResourceBroker =
+        typeof options.produceBuiltinArtifact === 'function';
+    const manager = getExtensionManager({
+        ...options,
+        hostCapabilities:
+            options.hostCapabilities ||
+            extensionHostCapabilities({ resourceBroker: hasResourceBroker }),
+    });
+    const referenceIndex = createExtensionReferenceIndex({
+        store: manager.store,
+    });
+    const resourceBroker = hasResourceBroker
+        ? createResourceBroker({
+              manager,
+              store: manager.store,
+              produceBuiltinArtifact: options.produceBuiltinArtifact,
+          })
+        : null;
+    setDefaultResourceBroker(resourceBroker);
     manager.setHostBindings({
         createServices: ({ extensionId, manifest, store }) =>
-            createBackendExtensionSdkV1({ extensionId, manifest, store }),
-        registerContribution: registerExtension,
+            createBackendExtensionSdkV1({
+                extensionId,
+                manifest,
+                store,
+                resourceBroker,
+                referenceIndex,
+            }),
+        registerContribution: (contribution, context) =>
+            registerExtension({
+                ...contribution,
+                extensionId: context?.extensionId || contribution.extensionId,
+                manifest: context?.manifest || contribution.manifest,
+            }),
         unregisterContribution: unregisterExtension,
     });
     // Register manifests even when a product slice did not import a concrete
@@ -38,6 +72,8 @@ export function initializeExtensionHost(options = {}) {
         gateway: createExtensionGateway(manager),
         registered: listRegisteredExtensions(),
         configHostingAdapter,
+        resourceBroker,
+        referenceIndex,
     };
 }
 

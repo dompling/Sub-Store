@@ -3,7 +3,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    image: sub-store-backend:local
+    image: "${SUB_STORE_IMAGE:-sub-store-backend:local}"
     init: true
     restart: unless-stopped
     env_file:

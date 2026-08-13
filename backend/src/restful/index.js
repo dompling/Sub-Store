@@ -45,6 +45,8 @@ import { EXTENSION_IDS } from '@/extensions/contracts';
 
 export default function serve() {
     const { manager: extensionManager } = initializeExtensionHost({
+        executionLane: 'parser',
+        produceBuiltinArtifact,
         configHosting: {
             startScheduledJobs: ({ isActive } = {}) =>
                 startArtifactCronJobs(syncArtifactItem, { isActive }),

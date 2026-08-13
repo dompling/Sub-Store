@@ -28,7 +28,10 @@ serve();
 
 function serve() {
     const $app = express({ substore: $ });
-    const { manager: extensionManager } = initializeExtensionHost();
+    const { manager: extensionManager } = initializeExtensionHost({
+        executionLane: 'parser',
+        produceBuiltinArtifact,
+    });
     loadBundledExtensions(extensionManager);
 
     // register routes

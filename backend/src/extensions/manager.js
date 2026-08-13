@@ -71,6 +71,7 @@ const KNOWN_EXTENSION_PERMISSIONS = Object.freeze([
     'resources.read',
     'resources.produce',
     'references.manage-own',
+    'references.read-own',
     'publishers.use',
     'credentials.use-handle',
     'scheduler.jobs',
@@ -113,6 +114,21 @@ const DEFAULT_EXTENSION_HOST_CAPABILITIES = Object.freeze({
         implementation: 'extension-route-gateway',
     }),
 });
+
+export const RESOURCE_BROKER_HOST_CAPABILITY = Object.freeze({
+    status: 'available',
+    complete: true,
+    implementation: 'host-resource-broker',
+});
+
+export function extensionHostCapabilities({ resourceBroker = false } = {}) {
+    return {
+        ...clone(DEFAULT_EXTENSION_HOST_CAPABILITIES),
+        ...(resourceBroker
+            ? { 'resource-broker@1': clone(RESOURCE_BROKER_HOST_CAPABILITY) }
+            : {}),
+    };
+}
 let taskSequence = 0;
 
 function now() {
@@ -437,8 +453,7 @@ function sourceDiscoveryFingerprint(source) {
         url: source.url || null,
         status: source.status || 'ready',
         verified: source.verified === true,
-        verificationMode:
-            source.verificationMode || 'community-unsigned',
+        verificationMode: source.verificationMode || 'community-unsigned',
         digest: source.digest || null,
         publisher: source.publisher || null,
         entries: source.entries || [],
@@ -2022,20 +2037,13 @@ export class ExtensionManager {
                         typeof name === 'string' && name.trim()
                             ? name.trim().slice(0, 200)
                             : sourceAtCommit?.name || sourceRecord.name,
-                    addedAt:
-                        sourceAtCommit?.addedAt || sourceRecord.addedAt,
+                    addedAt: sourceAtCommit?.addedAt || sourceRecord.addedAt,
                     generation: nextSourceGeneration(state, sourceAtCommit),
                 };
-                this._assertCommunitySourceCommit(
-                    state,
-                    sourceId,
-                    nextSource,
-                );
+                this._assertCommunitySourceCommit(state, sourceId, nextSource);
                 state.sources[sourceId] = nextSource;
                 this._recordAudit(state, {
-                    action: sourceAtCommit
-                        ? 'refresh-source'
-                        : 'add-source',
+                    action: sourceAtCommit ? 'refresh-source' : 'add-source',
                     sourceId,
                     result: 'ready',
                     entryCount: nextSource.entries.length,
@@ -2168,8 +2176,7 @@ export class ExtensionManager {
                         source.status = 'error';
                         source.lastError = {
                             code:
-                                error.code ||
-                                'EXTENSION_SOURCE_REFRESH_FAILED',
+                                error.code || 'EXTENSION_SOURCE_REFRESH_FAILED',
                             message: error.message,
                         };
                         source.updatedAt = now();
@@ -2289,8 +2296,7 @@ export class ExtensionManager {
                             sourceDiscoveryFingerprint({
                                 ...source,
                                 ...nextProjection,
-                            }) !==
-                            result.fingerprint
+                            }) !== result.fingerprint
                         ) {
                             Object.assign(source, nextProjection, {
                                 headers: clone(loaded.headers),
@@ -2384,9 +2390,7 @@ export class ExtensionManager {
         })();
 
         const trackedRefreshFlight = refreshFlight.finally(() => {
-            if (
-                this.sourceDiscoveryRefreshFlight === trackedRefreshFlight
-            ) {
+            if (this.sourceDiscoveryRefreshFlight === trackedRefreshFlight) {
                 this.sourceDiscoveryRefreshFlight = null;
             }
         });
@@ -2758,7 +2762,10 @@ export class ExtensionManager {
                         'The Host cannot register extension contributions',
                     );
                 }
-                return this.hostBindings.registerContribution(contribution);
+                return this.hostBindings.registerContribution(contribution, {
+                    extensionId,
+                    manifest,
+                });
             },
             unregisterContribution: () =>
                 this.hostBindings.unregisterContribution?.(extensionId),
@@ -2768,6 +2775,7 @@ export class ExtensionManager {
     }
 
     _activateRecord(record) {
+        this._preflightManifest(this.getManifest(record.extensionId));
         const facade = this._hostFacade(record.extensionId);
         if (this.packageStore && record.entrypoint) {
             const runtimeModule = this.packageStore.load(record);

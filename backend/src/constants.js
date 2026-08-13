@@ -12,6 +12,8 @@ export const ARTIFACTS_KEY = 'artifacts';
 export const LEGACY_EXTENSIONS_KEY = '#sub-store-extensions';
 export const EXTENSION_STATE_INDEX_KEY = '#sub-store-extension-index';
 export const EXTENSION_RECORD_KEY_PREFIX = '#sub-store-extension:';
+export const EXTENSION_REFERENCE_INDEX_KEY =
+    '#sub-store-extension-reference-index';
 // Retain the historical import name for callers that only need the current
 // lifecycle state identity. The legacy aggregate key is explicitly named
 // above and is read only by the migration path.

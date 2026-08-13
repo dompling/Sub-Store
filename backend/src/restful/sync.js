@@ -34,6 +34,8 @@ import { applyAgeOutputEncryption } from '@/restful/age-output';
 import { maskAgeSecretInUrl } from '@/utils/age';
 import { isMihomoConfigFile, normalizeFileConfig } from '@/utils/file-type';
 import { getArtifactSourceAdapter } from '@/extensions/registry';
+import { getDefaultResourceBroker } from '@/extensions/resource-broker';
+import { RESOURCE_OUTPUT_SCHEMA } from '@/extensions/resource-contracts';
 import { formatErrorReason } from '@/utils/error-reason';
 import '@/extensions/bundled';
 
@@ -946,6 +948,21 @@ async function produceBuiltinArtifact({
 }
 
 async function produceArtifact(input) {
+    if (input.sourceRef) {
+        const broker = getDefaultResourceBroker();
+        if (!broker) {
+            const error = new Error('Host Resource Broker is unavailable');
+            error.code = 'RESOURCE_BROKER_UNAVAILABLE';
+            error.statusCode = 409;
+            throw error;
+        }
+        const output = await broker.produce(input.sourceRef, {
+            representation: input.representation,
+            target: input.platform,
+            freshnessPolicy: input.freshnessPolicy,
+        });
+        return output.body;
+    }
     if (
         ['subscription', 'sub', 'collection', 'col', 'rule', 'file'].includes(
             input.type,
@@ -959,10 +976,20 @@ async function produceArtifact(input) {
         error.code = 'UNSUPPORTED_ARTIFACT_TYPE';
         throw error;
     }
-    return adapter.produce({
+    const output = await adapter.produce({
         ...input,
         produceBuiltinArtifact,
     });
+    if (
+        output &&
+        typeof output === 'object' &&
+        !Array.isArray(output) &&
+        typeof output.body === 'string' &&
+        (output.schema === RESOURCE_OUTPUT_SCHEMA || output.representation)
+    ) {
+        return output.body;
+    }
+    return output;
 }
 
 function resolveArtifactSourcePlatform(adapter, platform) {
@@ -1053,6 +1080,7 @@ function shouldUploadArtifact(artifact) {
 }
 
 function findArtifactSourceConfig(artifact) {
+    if (artifact?.sourceRef) return null;
     if (!artifact?.source) return null;
 
     if (['subscription', 'sub'].includes(artifact.type)) {
@@ -1075,7 +1103,9 @@ function findArtifactSourceConfig(artifact) {
 
 async function produceSyncArtifactOutput(artifact) {
     const useMihomoExternal = artifact.platform === 'SurgeMac';
-    const adapter = getArtifactSourceAdapter(artifact.type);
+    const adapter = artifact.sourceRef
+        ? null
+        : getArtifactSourceAdapter(artifact.type);
     const platform = adapter
         ? resolveArtifactSourcePlatform(adapter, artifact.platform)
         : artifact.platform;
@@ -1087,6 +1117,8 @@ async function produceSyncArtifactOutput(artifact) {
     const output = await produceArtifact({
         type: artifact.type,
         name: artifact.source,
+        sourceRef: artifact.sourceRef,
+        representation: artifact.representation,
         platform,
         produceOpts: {
             'include-unsupported-proxy': artifact.includeUnsupportedProxy,
@@ -1393,7 +1425,7 @@ async function syncArtifactItem(name) {
         );
     }
 
-    if (!artifact.source) {
+    if (!artifact.source && !artifact.sourceRef) {
         $.error(`远程配置 ${formatArtifactLogName(artifact)} 未设置来源`);
         throw new ResourceNotFoundError(
             'RESOURCE_HAS_NO_SOURCE',

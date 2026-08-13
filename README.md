@@ -226,6 +226,53 @@ docker compose down
 `docker compose down` keeps the named data volume. Add `--volumes` only when
 you intentionally want to delete all persisted Sub-Store data.
 
+### GitHub Container Registry
+
+The repository also provides `.github/workflows/container.yml`, which builds
+the existing `backend/Dockerfile` for `linux/amd64` and `linux/arm64` and
+publishes it to GitHub Container Registry:
+
+```text
+ghcr.io/dompling/sub-store
+```
+
+The workflow runs the backend test suite, then builds without pushing on pull
+requests. Backend changes pushed to `master` publish rolling `master`, SHA, and
+`latest` tags. After the repository's existing `build` release workflow
+succeeds (including its test suite), the same commit is also published with the
+version from `backend/package.json` and its major/minor tag. Manually pushed
+version tags (`X.Y.Z` or `vX.Y.Z`) are supported too and must match
+`backend/package.json`. The release hook also verifies that the generated
+version tag points to the exact commit being packaged.
+This extra release-workflow hook is necessary because GitHub does not start a
+second workflow from a tag created by the repository `GITHUB_TOKEN`.
+
+A manual run builds the selected branch and only pushes it when the `publish`
+input is enabled. This keeps semantic-version tags tied to successful releases
+while branch and `latest` remain rolling images. Images are built for both
+`linux/amd64` and `linux/arm64`.
+
+To use the published image with the existing Compose file, authenticate to
+GHCR when the package is private, set `SUB_STORE_IMAGE` in `.env`, pull, and
+start without rebuilding:
+
+```dotenv
+SUB_STORE_IMAGE=ghcr.io/dompling/sub-store:latest
+```
+
+```bash
+docker login ghcr.io
+docker compose pull
+docker compose up -d --no-build
+```
+
+The workflow uses the repository `GITHUB_TOKEN` with `packages: write`; no
+additional publish secret is required. GitHub may create the container package
+as private on its first publish, so adjust the package visibility in the
+repository's Packages settings if a public image is intended. The workflow
+file must first be present on the default branch before its manual-run control
+and release-workflow hook are available in GitHub Actions.
+
 ## LICENSE
 
 This project is under the GPL V3 LICENSE.
