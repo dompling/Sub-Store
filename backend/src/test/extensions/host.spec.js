@@ -771,6 +771,18 @@ describe('Extension Host foundation', function () {
             );
             expect(unchangedSourcesResponse.statusCode).to.equal(304);
 
+            const sourceRefreshResponse = createResponse();
+            await handlers.get('POST /api/extensions/sources/refresh')(
+                { body: {}, headers: {} },
+                sourceRefreshResponse,
+            );
+            expect(sourceRefreshResponse.statusCode).to.equal(200);
+            expect(sourceRefreshResponse.body.data).to.include({
+                changed: false,
+                successCount: 0,
+                failureCount: 0,
+            });
+
             const installResponse = createResponse();
             await handlers.get('POST /api/admin/extensions/:id/install')(
                 {
@@ -878,6 +890,27 @@ describe('Extension Host foundation', function () {
                 'token',
             );
 
+            const discoveryRefreshResponse = createResponse();
+            await handlers.get('POST /api/extensions/sources/refresh')(
+                { body: {}, headers: {} },
+                discoveryRefreshResponse,
+            );
+            expect(discoveryRefreshResponse.statusCode).to.equal(200);
+            expect(discoveryRefreshResponse.body.data).to.include({
+                changed: false,
+                successCount: 0,
+                failureCount: 0,
+            });
+
+            const forcedRefreshResponse = createResponse();
+            await handlers.get(
+                'POST /api/admin/extensions/sources/refresh',
+            )({ body: {}, headers: {} }, forcedRefreshResponse);
+            expect(forcedRefreshResponse.statusCode).to.equal(401);
+            expect(forcedRefreshResponse.body.error.code).to.equal(
+                'EXTENSION_ADMIN_AUTH_REQUIRED',
+            );
+
             const missingResponse = createResponse();
             await handlers.get('POST /api/admin/extensions/:id/install')(
                 {
@@ -890,6 +923,9 @@ describe('Extension Host foundation', function () {
             expect(missingResponse.statusCode).to.equal(401);
             expect(missingResponse.body.error.code).to.equal(
                 'EXTENSION_ADMIN_AUTH_REQUIRED',
+            );
+            expect(missingResponse.body.error.message).to.equal(
+                'Extension administrator authentication is required',
             );
 
             const invalidResponse = createResponse();
@@ -904,6 +940,9 @@ describe('Extension Host foundation', function () {
             expect(invalidResponse.statusCode).to.equal(403);
             expect(invalidResponse.body.error.code).to.equal(
                 'EXTENSION_ADMIN_UNAUTHORIZED',
+            );
+            expect(invalidResponse.body.error.message).to.equal(
+                'Extension administrator authentication failed',
             );
 
             const authorizedResponse = createResponse();

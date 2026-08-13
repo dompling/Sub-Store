@@ -413,6 +413,8 @@ export async function fetchExtensionSourceDocument(
                 redirect: 'manual',
                 headers: {
                     accept: 'application/json',
+                    'cache-control': 'no-cache',
+                    pragma: 'no-cache',
                     'user-agent': 'Sub-Store-Extension-Host/1',
                 },
                 signal: controller?.signal,
@@ -899,17 +901,45 @@ export function normalizeCommunityCatalog(document, sourceUrl, sourceId) {
             releases,
         });
     }
+    const normalizedExpiry = (value, field) => {
+        if (value == null || value === '') return null;
+        const timestamp = Number.isFinite(value)
+            ? Number(value)
+            : typeof value === 'string'
+            ? Date.parse(value)
+            : Number.NaN;
+        if (!Number.isFinite(timestamp)) {
+            throw sourceError(
+                'EXTENSION_SOURCE_CATALOG_EXPIRY_INVALID',
+                `Extension source catalog ${field} is invalid`,
+                { field },
+                422,
+            );
+        }
+        return { timestamp, value };
+    };
+    const expiryCandidates = [
+        normalizedExpiry(payload.expiresAt, 'payload.expiresAt'),
+        normalizedExpiry(envelope?.expiresAt, 'envelope.expiresAt'),
+    ].filter(Boolean);
+    const expiresAt = expiryCandidates.reduce(
+        (earliest, candidate) =>
+            !earliest || candidate.timestamp < earliest.timestamp
+                ? candidate
+                : earliest,
+        null,
+    )?.value;
     return {
         schemaVersion: 1,
         sequence: Number.isInteger(payload.sequence) ? payload.sequence : 0,
         generatedAt: payload.generatedAt || null,
-        expiresAt: payload.expiresAt || null,
+        expiresAt: expiresAt ?? null,
         publisher,
         entries,
         envelope: envelope
             ? {
                   signature: cloneExtensionValue(envelope.signature),
-                  expiresAt: envelope.expiresAt || null,
+                  expiresAt: envelope.expiresAt ?? null,
               }
             : null,
     };

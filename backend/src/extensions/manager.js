@@ -53,6 +53,10 @@ const MAX_PACKAGE_FILES = 128;
 const MAX_PACKAGE_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_PACKAGE_BYTES = 8 * 1024 * 1024;
 const MAX_ROLLBACK_VERSIONS = 3;
+const MAX_COMMUNITY_SOURCES = 32;
+const SOURCE_DISCOVERY_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+const MAX_DISCOVERY_REFRESH_ITEMS = MAX_COMMUNITY_SOURCES;
+const MAX_DISCOVERY_REFRESH_MESSAGE_LENGTH = 300;
 const RESERVED_PACKAGE_FILES = new Set([
     'manifest.json',
     'receipt.json',
@@ -413,6 +417,69 @@ function sourceCanReplaceRemovedInstallation(record) {
     );
 }
 
+function sourceGeneration(source) {
+    return Number.isInteger(source?.generation) && source.generation >= 0
+        ? source.generation
+        : 0;
+}
+
+function nextSourceGeneration(state, source) {
+    return Math.max(
+        sourceGeneration(source) + 1,
+        Number.isInteger(state?.revision) ? state.revision + 1 : 1,
+    );
+}
+
+function sourceDiscoveryFingerprint(source) {
+    if (!source) return null;
+    return canonicalJson({
+        generation: sourceGeneration(source),
+        url: source.url || null,
+        status: source.status || 'ready',
+        verified: source.verified === true,
+        verificationMode:
+            source.verificationMode || 'community-unsigned',
+        digest: source.digest || null,
+        publisher: source.publisher || null,
+        entries: source.entries || [],
+        sequence: source.sequence || 0,
+        generatedAt: source.generatedAt || null,
+        expiresAt: source.expiresAt || null,
+        lastError: source.lastError || null,
+    });
+}
+
+function assertUniqueCommunitySourceEntries(sources = {}) {
+    const sourceOwnerByExtensionId = new Map();
+    for (const [sourceId, source] of Object.entries(sources || {})) {
+        for (const entry of source.entries || []) {
+            const owner = sourceOwnerByExtensionId.get(entry.id);
+            if (owner && owner !== sourceId) {
+                throw errorWithCode(
+                    'EXTENSION_SOURCE_ID_CONFLICT',
+                    `Community extension ${entry.id} is provided by more than one source`,
+                    {
+                        extensionId: entry.id,
+                        existingSourceId: owner,
+                        sourceId,
+                    },
+                );
+            }
+            sourceOwnerByExtensionId.set(entry.id, sourceId);
+        }
+    }
+}
+
+function discoveryError(error) {
+    return {
+        code: error?.code || 'EXTENSION_SOURCE_REFRESH_FAILED',
+        message: `${error?.message || 'Extension source refresh failed'}`.slice(
+            0,
+            MAX_DISCOVERY_REFRESH_MESSAGE_LENGTH,
+        ),
+    };
+}
+
 function stateRecordFromBundled(entry) {
     const manifest = entry.manifest;
     return {
@@ -744,6 +811,41 @@ function assertImmutableSourceVersions(previousEntries, nextEntries) {
     }
 }
 
+function catalogExpiryTimestamp(value) {
+    if (value == null || value === '') return null;
+    if (Number.isFinite(value)) return Number(value);
+    if (typeof value === 'string') {
+        const parsed = Date.parse(value);
+        if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+}
+
+function assertCommunitySourceFreshness(previousSource, loaded) {
+    const previousSequence = Number(previousSource?.sequence || 0);
+    const nextSequence = Number(loaded?.sequence || 0);
+    if (
+        previousSource &&
+        Number.isInteger(previousSequence) &&
+        Number.isInteger(nextSequence) &&
+        nextSequence < previousSequence
+    ) {
+        throw errorWithCode(
+            'EXTENSION_SOURCE_SEQUENCE_ROLLBACK',
+            'Extension source catalog sequence moved backwards',
+            { previousSequence, nextSequence },
+        );
+    }
+    const expiresAt = catalogExpiryTimestamp(loaded?.expiresAt);
+    if (expiresAt !== null && expiresAt <= now()) {
+        throw errorWithCode(
+            'EXTENSION_SOURCE_CATALOG_EXPIRED',
+            'Extension source catalog has expired',
+            { expiresAt: loaded.expiresAt },
+        );
+    }
+}
+
 function catalogEntryKey(id, version) {
     return `${id}\u0000${version}`;
 }
@@ -898,6 +1000,12 @@ export class ExtensionManager {
         // Tests and embedders may provide a bounded fetch implementation. The
         // production Node path uses the guarded fetcher from sources.js.
         this.sourceFetcher = sourceFetcher || null;
+        // Page-entry discovery checks can be triggered by several tabs at the
+        // same time. Keep one in-flight refresh per Host process so trusted
+        // catalogs are fetched and committed only once.
+        this.sourceDiscoveryRefreshFlight = null;
+        this.sourceDiscoveryRefreshResult = null;
+        this.sourceDiscoveryRefreshedAt = 0;
         const storageIdentitySeed =
             this.packageStore?.rootPath ||
             this.store?.identity ||
@@ -1774,6 +1882,38 @@ export class ExtensionManager {
         }
     }
 
+    _assertCommunitySourceCommit(state, sourceId, sourceRecord) {
+        const sourceAtCommit = state.sources?.[sourceId] || null;
+        assertCommunitySourceFreshness(sourceAtCommit, sourceRecord);
+        if (sourceAtCommit) {
+            assertImmutableSourceVersions(
+                sourceAtCommit.entries,
+                sourceRecord.entries,
+            );
+        }
+        const nextSources = {
+            ...(state.sources || {}),
+            [sourceId]: sourceRecord,
+        };
+        assertUniqueCommunitySourceEntries(nextSources);
+        const builtInIds = new Set(
+            [...this.bundledCatalog, ...this.officialCatalog].map(
+                (entry) => (entry.manifest || entry).id,
+            ),
+        );
+        const conflictingEntry = sourceRecord.entries.find((entry) =>
+            builtInIds.has(entry.id),
+        );
+        if (conflictingEntry) {
+            throw errorWithCode(
+                'EXTENSION_SOURCE_ID_RESERVED',
+                `Community source cannot replace built-in extension ${conflictingEntry.id}`,
+                { extensionId: conflictingEntry.id },
+            );
+        }
+        return sourceAtCommit;
+    }
+
     async _loadCommunitySource(url, sourceId) {
         const fetched = await fetchExtensionSourceDocument(url, {
             fetcher: this.sourceFetcher,
@@ -1806,10 +1946,23 @@ export class ExtensionManager {
         const sourceId = extensionSourceId(normalizedUrl);
         const current = this.readState();
         const existing = current.sources?.[sourceId];
+        const addFingerprint = sourceDiscoveryFingerprint(existing);
+        const addGeneration = sourceGeneration(existing);
+        if (
+            !existing &&
+            Object.keys(current.sources || {}).length >= MAX_COMMUNITY_SOURCES
+        ) {
+            throw errorWithCode(
+                'EXTENSION_SOURCE_LIMIT_REACHED',
+                `Extension source limit of ${MAX_COMMUNITY_SOURCES} has been reached`,
+                { maxSources: MAX_COMMUNITY_SOURCES },
+            );
+        }
         if (existing && existing.lastIdempotencyKey === idempotencyKey) {
             return publicExtensionSource(existing);
         }
         const loaded = await this._loadCommunitySource(normalizedUrl, sourceId);
+        assertCommunitySourceFreshness(existing, loaded);
         if (existing) {
             assertImmutableSourceVersions(existing.entries, loaded.entries);
         }
@@ -1834,15 +1987,58 @@ export class ExtensionManager {
             updatedAt: now(),
             lastError: null,
             lastIdempotencyKey: idempotencyKey || null,
+            generation: sourceGeneration(existing) + 1,
         };
         const committed = this._commit(
             (state) => {
-                state.sources[sourceId] = sourceRecord;
+                const sourceAtCommit = state.sources?.[sourceId];
+                if (
+                    !sourceAtCommit &&
+                    Object.keys(state.sources || {}).length >=
+                        MAX_COMMUNITY_SOURCES
+                ) {
+                    throw errorWithCode(
+                        'EXTENSION_SOURCE_LIMIT_REACHED',
+                        `Extension source limit of ${MAX_COMMUNITY_SOURCES} has been reached`,
+                        { maxSources: MAX_COMMUNITY_SOURCES },
+                    );
+                }
+                const sourceUnchanged = existing
+                    ? Boolean(sourceAtCommit) &&
+                      sourceGeneration(sourceAtCommit) === addGeneration &&
+                      sourceDiscoveryFingerprint(sourceAtCommit) ===
+                          addFingerprint
+                    : !sourceAtCommit;
+                if (!sourceUnchanged) {
+                    throw errorWithCode(
+                        'EXTENSION_CONSISTENCY_CONFLICT',
+                        'Extension source changed while its add request was in flight',
+                        { sourceId },
+                    );
+                }
+                const nextSource = {
+                    ...sourceRecord,
+                    name:
+                        typeof name === 'string' && name.trim()
+                            ? name.trim().slice(0, 200)
+                            : sourceAtCommit?.name || sourceRecord.name,
+                    addedAt:
+                        sourceAtCommit?.addedAt || sourceRecord.addedAt,
+                    generation: nextSourceGeneration(state, sourceAtCommit),
+                };
+                this._assertCommunitySourceCommit(
+                    state,
+                    sourceId,
+                    nextSource,
+                );
+                state.sources[sourceId] = nextSource;
                 this._recordAudit(state, {
-                    action: existing ? 'refresh-source' : 'add-source',
+                    action: sourceAtCommit
+                        ? 'refresh-source'
+                        : 'add-source',
                     sourceId,
                     result: 'ready',
-                    entryCount: sourceRecord.entries.length,
+                    entryCount: nextSource.entries.length,
                 });
                 return state;
             },
@@ -1869,17 +2065,26 @@ export class ExtensionManager {
         if (existing.lastIdempotencyKey === idempotencyKey) {
             return publicExtensionSource(existing);
         }
+        const refreshFingerprint = sourceDiscoveryFingerprint(existing);
+        const refreshGeneration = sourceGeneration(existing);
         try {
             const loaded = await this._loadCommunitySource(
                 existing.url,
                 sourceId,
             );
+            assertCommunitySourceFreshness(existing, loaded);
             assertImmutableSourceVersions(existing.entries, loaded.entries);
             const committed = this._commit(
                 (state) => {
                     const source = state.sources[sourceId];
-                    if (!source) return state;
-                    Object.assign(source, {
+                    if (!source) {
+                        throw errorWithCode(
+                            'EXTENSION_SOURCE_NOT_FOUND',
+                            `Extension source ${sourceId} was not found`,
+                        );
+                    }
+                    const nextSource = {
+                        ...source,
                         status: 'ready',
                         verified: loaded.verified,
                         verificationMode: loaded.verificationMode,
@@ -1895,12 +2100,30 @@ export class ExtensionManager {
                         updatedAt: now(),
                         lastError: null,
                         lastIdempotencyKey: idempotencyKey || null,
-                    });
+                        generation: nextSourceGeneration(state, source),
+                    };
+                    this._assertCommunitySourceCommit(
+                        state,
+                        sourceId,
+                        nextSource,
+                    );
+                    if (
+                        sourceGeneration(source) !== refreshGeneration ||
+                        sourceDiscoveryFingerprint(source) !==
+                            refreshFingerprint
+                    ) {
+                        throw errorWithCode(
+                            'EXTENSION_CONSISTENCY_CONFLICT',
+                            'Extension source changed while its refresh was in flight',
+                            { sourceId },
+                        );
+                    }
+                    state.sources[sourceId] = nextSource;
                     this._recordAudit(state, {
                         action: 'refresh-source',
                         sourceId,
                         result: 'ready',
-                        entryCount: source.entries.length,
+                        entryCount: nextSource.entries.length,
                     });
                     return state;
                 },
@@ -1908,23 +2131,52 @@ export class ExtensionManager {
             );
             return publicExtensionSource(committed.sources[sourceId]);
         } catch (error) {
+            const latestState = this.readState();
+            const latestSource = latestState.sources?.[sourceId];
+            if (error.code === 'EXTENSION_CONSISTENCY_CONFLICT') {
+                error.source = publicExtensionSource(latestSource);
+                throw error;
+            }
+            if (
+                !latestSource ||
+                (expectedRevision !== undefined &&
+                    Number(expectedRevision) !==
+                        Number(latestState.revision)) ||
+                sourceDiscoveryFingerprint(latestSource) !==
+                    refreshFingerprint ||
+                sourceGeneration(latestSource) !== refreshGeneration
+            ) {
+                error.source = publicExtensionSource(latestSource);
+                throw error;
+            }
             try {
                 const failedState = this._commit(
                     (state) => {
                         const source = state.sources[sourceId];
-                        if (source) {
-                            source.status = 'error';
-                            source.lastError = {
-                                code:
-                                    error.code ||
-                                    'EXTENSION_SOURCE_REFRESH_FAILED',
-                                message: error.message,
-                            };
-                            source.updatedAt = now();
+                        if (
+                            !source ||
+                            sourceGeneration(source) !== refreshGeneration ||
+                            sourceDiscoveryFingerprint(source) !==
+                                refreshFingerprint
+                        ) {
+                            throw errorWithCode(
+                                'EXTENSION_CONSISTENCY_CONFLICT',
+                                'Extension source changed while its refresh was in flight',
+                                { sourceId },
+                            );
                         }
+                        source.status = 'error';
+                        source.lastError = {
+                            code:
+                                error.code ||
+                                'EXTENSION_SOURCE_REFRESH_FAILED',
+                            message: error.message,
+                        };
+                        source.updatedAt = now();
+                        source.generation = nextSourceGeneration(state, source);
                         return state;
                     },
-                    { expectedRevision },
+                    { expectedRevision: latestState.revision },
                 );
                 error.source = publicExtensionSource(
                     failedState.sources[sourceId],
@@ -1934,6 +2186,212 @@ export class ExtensionManager {
             }
             throw error;
         }
+    }
+
+    async refreshSourcesForDiscovery({ force = false } = {}) {
+        if (!this.env.isNode) {
+            throw errorWithCode(
+                'EXTENSION_SOURCE_MANAGEMENT_UNSUPPORTED',
+                'Community extension sources are only available on the Node Host',
+            );
+        }
+        if (this.sourceDiscoveryRefreshFlight) {
+            return this.sourceDiscoveryRefreshFlight;
+        }
+        if (
+            !force &&
+            this.sourceDiscoveryRefreshResult &&
+            now() - this.sourceDiscoveryRefreshedAt <
+                SOURCE_DISCOVERY_REFRESH_INTERVAL_MS
+        ) {
+            return {
+                ...clone(this.sourceDiscoveryRefreshResult),
+                cached: true,
+            };
+        }
+
+        const refreshFlight = (async () => {
+            const snapshot = this.readState();
+            const sources = Object.values(snapshot.sources || {});
+            if (sources.length === 0) {
+                return {
+                    changed: false,
+                    refreshedAt: now(),
+                    successCount: 0,
+                    failureCount: 0,
+                    items: [],
+                };
+            }
+
+            const results = await Promise.all(
+                sources.map(async (source) => {
+                    const fingerprint = sourceDiscoveryFingerprint(source);
+                    try {
+                        const loaded = await this._loadCommunitySource(
+                            source.url,
+                            source.id,
+                        );
+                        assertCommunitySourceFreshness(source, loaded);
+                        assertImmutableSourceVersions(
+                            source.entries,
+                            loaded.entries,
+                        );
+                        return {
+                            id: source.id,
+                            url: source.url,
+                            fingerprint,
+                            loaded,
+                        };
+                    } catch (error) {
+                        return {
+                            id: source.id,
+                            url: source.url,
+                            fingerprint,
+                            error,
+                        };
+                    }
+                }),
+            );
+            const refreshedAt = now();
+
+            const buildCandidate = (baseState) => {
+                const applicable = results.filter((result) => {
+                    const source = baseState.sources?.[result.id];
+                    return (
+                        source &&
+                        source.url === result.url &&
+                        sourceDiscoveryFingerprint(source) ===
+                            result.fingerprint
+                    );
+                });
+                const nextSources = clone(baseState.sources || {});
+                const changedResults = [];
+
+                for (const result of applicable) {
+                    const source = nextSources[result.id];
+                    if (result.loaded) {
+                        const loaded = result.loaded;
+                        const nextProjection = {
+                            status: 'ready',
+                            verified: loaded.verified,
+                            verificationMode: loaded.verificationMode,
+                            digest: loaded.digest,
+                            publisher: loaded.publisher
+                                ? clone(loaded.publisher)
+                                : null,
+                            entries: clone(loaded.entries),
+                            sequence: loaded.sequence,
+                            generatedAt: loaded.generatedAt,
+                            expiresAt: loaded.expiresAt,
+                            lastError: null,
+                        };
+                        if (
+                            sourceDiscoveryFingerprint({
+                                ...source,
+                                ...nextProjection,
+                            }) !==
+                            result.fingerprint
+                        ) {
+                            Object.assign(source, nextProjection, {
+                                headers: clone(loaded.headers),
+                                updatedAt: refreshedAt,
+                                generation: nextSourceGeneration(
+                                    baseState,
+                                    source,
+                                ),
+                            });
+                            changedResults.push(result);
+                        }
+                        continue;
+                    }
+
+                    // Automatic discovery is read-mostly. A transient fetch
+                    // failure must not replace the last trusted catalog or
+                    // churn the persisted revision. Manual administrator
+                    // refreshes continue to persist source errors.
+                }
+
+                if (changedResults.length > 0) {
+                    assertUniqueCommunitySourceEntries(nextSources);
+                }
+                return {
+                    applicable,
+                    changedResults,
+                    nextSources,
+                    changed: changedResults.length > 0,
+                };
+            };
+
+            let candidate;
+            for (let attempt = 0; attempt < 2; attempt += 1) {
+                const baseState = this.readState();
+                candidate = buildCandidate(baseState);
+                if (!candidate.changed) break;
+                try {
+                    this._commit(
+                        (state) => {
+                            for (const result of candidate.changedResults) {
+                                state.sources[result.id] =
+                                    candidate.nextSources[result.id];
+                            }
+                            this._recordAudit(state, {
+                                action: 'refresh-sources-discovery',
+                                result: 'complete',
+                                successCount: candidate.applicable.filter(
+                                    (result) => result.loaded,
+                                ).length,
+                                failureCount: candidate.applicable.filter(
+                                    (result) => result.error,
+                                ).length,
+                            });
+                            return state;
+                        },
+                        { expectedRevision: baseState.revision },
+                    );
+                    break;
+                } catch (error) {
+                    if (
+                        error.code !== 'EXTENSION_CONSISTENCY_CONFLICT' ||
+                        attempt === 1
+                    ) {
+                        throw error;
+                    }
+                    candidate = null;
+                }
+            }
+
+            const applicable = candidate?.applicable || [];
+            const result = {
+                changed: candidate?.changed === true,
+                refreshedAt,
+                successCount: applicable.filter((result) => result.loaded)
+                    .length,
+                failureCount: applicable.filter((result) => result.error)
+                    .length,
+                items: applicable
+                    .slice(0, MAX_DISCOVERY_REFRESH_ITEMS)
+                    .map((result) => ({
+                        id: result.id,
+                        status: result.loaded ? 'ready' : 'error',
+                        error: result.error
+                            ? discoveryError(result.error)
+                            : null,
+                    })),
+            };
+            this.sourceDiscoveryRefreshResult = clone(result);
+            this.sourceDiscoveryRefreshedAt = refreshedAt;
+            return result;
+        })();
+
+        const trackedRefreshFlight = refreshFlight.finally(() => {
+            if (
+                this.sourceDiscoveryRefreshFlight === trackedRefreshFlight
+            ) {
+                this.sourceDiscoveryRefreshFlight = null;
+            }
+        });
+        this.sourceDiscoveryRefreshFlight = trackedRefreshFlight;
+        return trackedRefreshFlight;
     }
 
     removeSource(sourceId, { expectedRevision, idempotencyKey } = {}) {

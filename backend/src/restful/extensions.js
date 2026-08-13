@@ -227,6 +227,20 @@ export function registerExtensionControlRoutes(
         });
     });
 
+    // This endpoint accepts no source URL or lifecycle input. It only checks
+    // catalogs the Host has already trusted and stored, so update discovery
+    // remains available even when management actions require an admin token.
+    $app.post('/api/extensions/sources/refresh', (req, res) =>
+        handle(res, () => manager.refreshSourcesForDiscovery()),
+    );
+
+    $app.post('/api/admin/extensions/sources/refresh', (req, res) =>
+        handle(res, () => {
+            assertAdmin(req);
+            return manager.refreshSourcesForDiscovery({ force: true });
+        }),
+    );
+
     $app.get('/api/extensions/installed', (req, res) =>
         success(res, {
             revision: manager.getRuntimeManifest().revision,

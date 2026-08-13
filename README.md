@@ -166,7 +166,7 @@ bundle the Front-End or HTTP-META. The raw backend therefore listens on
 container port `3000`, rather than the combined image's Front-End port `3001`.
 
 The container runs as a non-root user and stores Sub-Store data, MMDB files,
-backups, and installed extension packages under `/opt/app/data`. The default is
+backups, and installed plugin packages under `/opt/app/data`. The default is
 the named `sub-store-data` volume. Set `SUB_STORE_DATA_PATH` in `.env` to an
 absolute host directory to use the bind-mount layout shown in the official
 quick-start guide. Because this image runs as the non-root `node` user, that
@@ -189,7 +189,7 @@ The API is published at `http://127.0.0.1:3000` by default. Change
 `SUB_STORE_BACKEND_BIND_ADDRESS=0.0.0.0` when the backend must be reachable from
 the LAN. The example CORS allowlist accepts the local Front-End dev server on
 port `8888` and the official hosted Front-End. For a shared deployment, replace
-it with the exact origins you use and protect extension-management operations
+it with the exact origins you use and protect plugin-management operations
 with either `SUB_STORE_EXTENSION_ADMIN_TOKEN` or its SHA-256 digest in
 `SUB_STORE_EXTENSION_ADMIN_TOKEN_HASH`.
 

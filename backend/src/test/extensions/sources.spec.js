@@ -543,6 +543,92 @@ describe('Community extension sources', function () {
         ).to.equal(null);
     });
 
+    it('rejects an invalid payload expiry instead of hiding the envelope expiry', function () {
+        const fixture = contentFixture();
+        const sourceUrl = 'https://example.test/catalog.json';
+        const envelope = {
+            payload: {
+                ...clone(fixture.catalog),
+                expiresAt: 'not-a-valid-expiry',
+            },
+            expiresAt: Date.now() - 1000,
+            signature: {},
+        };
+
+        let error;
+        try {
+            normalizeCommunityCatalog(envelope, sourceUrl, 'source-test');
+        } catch (caught) {
+            error = caught;
+        }
+
+        expect(error).to.include({
+            code: 'EXTENSION_SOURCE_CATALOG_EXPIRY_INVALID',
+        });
+        expect(error.details).to.include({ field: 'payload.expiresAt' });
+    });
+
+    it('rejects an invalid envelope expiry even when the payload expiry is valid', function () {
+        const fixture = contentFixture();
+        const sourceUrl = 'https://example.test/catalog.json';
+        const envelope = {
+            payload: {
+                ...clone(fixture.catalog),
+                expiresAt: Date.now() + 60_000,
+            },
+            expiresAt: 'not-a-valid-expiry',
+            signature: {},
+        };
+
+        let error;
+        try {
+            normalizeCommunityCatalog(envelope, sourceUrl, 'source-test');
+        } catch (caught) {
+            error = caught;
+        }
+
+        expect(error).to.include({
+            code: 'EXTENSION_SOURCE_CATALOG_EXPIRY_INVALID',
+        });
+        expect(error.details).to.include({ field: 'envelope.expiresAt' });
+    });
+
+    it('keeps the earlier valid payload or envelope expiry', function () {
+        const fixture = contentFixture();
+        const sourceUrl = 'https://example.test/catalog.json';
+        const earlierNumeric = Date.now() + 60_000;
+        const laterIso = new Date(earlierNumeric + 60_000).toISOString();
+        const numericFirst = normalizeCommunityCatalog(
+            {
+                payload: {
+                    ...clone(fixture.catalog),
+                    expiresAt: earlierNumeric,
+                },
+                expiresAt: laterIso,
+                signature: {},
+            },
+            sourceUrl,
+            'source-test',
+        );
+        expect(numericFirst.expiresAt).to.equal(earlierNumeric);
+
+        const earlierIso = new Date(earlierNumeric).toISOString();
+        const laterNumeric = earlierNumeric + 60_000;
+        const envelopeFirst = normalizeCommunityCatalog(
+            {
+                payload: {
+                    ...clone(fixture.catalog),
+                    expiresAt: laterNumeric,
+                },
+                expiresAt: earlierIso,
+                signature: {},
+            },
+            sourceUrl,
+            'source-test',
+        );
+        expect(envelopeFirst.expiresAt).to.equal(earlierIso);
+    });
+
     it('rejects catalogs without an immutable package digest', function () {
         const fixture = contentFixture();
         const catalog = clone(fixture.catalog);
@@ -607,9 +693,13 @@ describe('Community extension sources', function () {
         const fixture = contentFixture();
         const sourceUrl = 'http://127.0.0.1/catalog.json';
         const packageUrl = 'http://127.0.0.1/content.json';
+        let requestOptions;
         fixture.catalog.entries[0].packageUrls.node = packageUrl;
         const fetched = await fetchExtensionSourceDocument(sourceUrl, {
-            fetcher: async () => response(fixture.catalog),
+            fetcher: async (_url, options) => {
+                requestOptions = options;
+                return response(fixture.catalog);
+            },
         });
         const catalog = normalizeCommunityCatalog(
             fetched.document,
@@ -617,6 +707,10 @@ describe('Community extension sources', function () {
             'source-local',
         );
         expect(catalog.entries[0].packageUrls.node).to.equal(packageUrl);
+        expect(requestOptions.headers).to.include({
+            'cache-control': 'no-cache',
+            pragma: 'no-cache',
+        });
     });
 
     it('allows HTTPS sources through proxy fake-IP DNS without admitting private targets', async function () {
@@ -915,6 +1009,1024 @@ describe('Community extension sources', function () {
         expect(manager.getSources()[0].publisher).to.deep.equal(
             refreshError.source.publisher,
         );
+    });
+
+    it('rejects a catalog sequence rollback and keeps the last trusted source', async function () {
+        const fixture = contentFixture();
+        const sourceUrl = 'https://example.test/catalog.json';
+        let activeCatalog = clone(fixture.catalog);
+        activeCatalog.sequence = 4;
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async () => response(activeCatalog),
+        });
+
+        const source = await manager.addSource({ url: sourceUrl });
+        activeCatalog = clone(activeCatalog);
+        activeCatalog.sequence = 3;
+
+        let refreshError;
+        try {
+            await manager.refreshSource(source.id);
+        } catch (error) {
+            refreshError = error;
+        }
+
+        expect(refreshError).to.include({
+            code: 'EXTENSION_SOURCE_SEQUENCE_ROLLBACK',
+        });
+        expect(manager.getSources()[0]).to.include({ entryCount: 1 });
+        expect(manager.readState().sources[source.id].sequence).to.equal(4);
+    });
+
+    it('rejects an expired catalog before trusting it as a source', async function () {
+        const fixture = contentFixture();
+        fixture.catalog.expiresAt = Date.now() - 1000;
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async () => response(fixture.catalog),
+        });
+
+        let addError;
+        try {
+            await manager.addSource({
+                url: 'https://example.test/catalog.json',
+            });
+        } catch (error) {
+            addError = error;
+        }
+
+        expect(addError).to.include({
+            code: 'EXTENSION_SOURCE_CATALOG_EXPIRED',
+        });
+        expect(manager.getSources()).to.deep.equal([]);
+    });
+
+    it('treats a zero catalog expiry as expired instead of missing', async function () {
+        const fixture = contentFixture();
+        fixture.catalog.expiresAt = 0;
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async () => response(fixture.catalog),
+        });
+
+        let addError;
+        try {
+            await manager.addSource({
+                url: 'https://example.test/catalog.json',
+            });
+        } catch (error) {
+            addError = error;
+        }
+
+        expect(addError).to.include({
+            code: 'EXTENSION_SOURCE_CATALOG_EXPIRED',
+        });
+        expect(manager.getSources()).to.deep.equal([]);
+    });
+
+    it('rejects an expired catalog envelope before trusting its payload', async function () {
+        const fixture = contentFixture();
+        const envelope = {
+            payload: clone(fixture.catalog),
+            expiresAt: Date.now() - 1000,
+            signature: {},
+        };
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async () => response(envelope),
+        });
+
+        let addError;
+        try {
+            await manager.addSource({
+                url: 'https://example.test/catalog.json',
+            });
+        } catch (error) {
+            addError = error;
+        }
+
+        expect(addError).to.include({
+            code: 'EXTENSION_SOURCE_CATALOG_EXPIRED',
+        });
+        expect(manager.getSources()).to.deep.equal([]);
+    });
+
+    it('does not let a slow source refresh overwrite a newer sequence', async function () {
+        const fixture = contentFixture();
+        const sourceUrl = 'https://example.test/catalog.json';
+        const initialCatalog = clone(fixture.catalog);
+        initialCatalog.sequence = 1;
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async () => response(initialCatalog),
+        });
+        const source = await manager.addSource({ url: sourceUrl });
+        let refreshCall = 0;
+        let slowStarted;
+        const slowStartedGate = new Promise((resolve) => {
+            slowStarted = resolve;
+        });
+        let releaseSlow;
+        const slowGate = new Promise((resolve) => {
+            releaseSlow = resolve;
+        });
+        manager._loadCommunitySource = async () => {
+            refreshCall += 1;
+            const catalog = clone(initialCatalog);
+            catalog.sequence = refreshCall === 1 ? 2 : 3;
+            const loaded = normalizeCommunityCatalog(
+                catalog,
+                sourceUrl,
+                source.id,
+            );
+            if (refreshCall === 1) {
+                slowStarted();
+                await slowGate;
+            }
+            return {
+                ...loaded,
+                url: sourceUrl,
+                digest: sha256Hex(JSON.stringify(catalog)),
+                headers: {},
+                verified: true,
+                verificationMode: 'community-integrity',
+            };
+        };
+
+        const slowRefresh = manager.refreshSource(source.id);
+        await slowStartedGate;
+        await manager.refreshSource(source.id);
+        releaseSlow();
+
+        let slowError;
+        try {
+            await slowRefresh;
+        } catch (error) {
+            slowError = error;
+        }
+
+        expect(slowError).to.include({
+            code: 'EXTENSION_SOURCE_SEQUENCE_ROLLBACK',
+        });
+        expect(manager.readState().sources[source.id]).to.include({
+            sequence: 3,
+            status: 'ready',
+        });
+    });
+
+    it('does not turn a revision conflict into a persisted source error', async function () {
+        const fixture = contentFixture();
+        const sourceUrl = 'https://example.test/catalog.json';
+        let fetchCount = 0;
+        let releaseRefresh;
+        const refreshGate = new Promise((resolve) => {
+            releaseRefresh = resolve;
+        });
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async () => {
+                fetchCount += 1;
+                if (fetchCount > 1) await refreshGate;
+                return response(fixture.catalog);
+            },
+        });
+        const source = await manager.addSource({ url: sourceUrl });
+        const expectedRevision = manager.getRuntimeManifest().revision;
+        const pending = manager.refreshSource(source.id, {
+            expectedRevision,
+        });
+        manager._commit((state) => {
+            state.migrations.concurrentManualRefresh = { completedAt: 1 };
+            return state;
+        });
+        releaseRefresh();
+
+        let refreshError;
+        try {
+            await pending;
+        } catch (error) {
+            refreshError = error;
+        }
+
+        expect(refreshError).to.include({
+            code: 'EXTENSION_CONSISTENCY_CONFLICT',
+        });
+        expect(manager.getSources()[0]).to.include({
+            status: 'ready',
+            lastError: null,
+        });
+        expect(manager.getRuntimeManifest().revision).to.equal(
+            expectedRevision + 1,
+        );
+    });
+
+    it('does not let an older failed refresh overwrite a newer successful refresh with identical content', async function () {
+        const fixture = contentFixture();
+        const sourceUrl = 'https://example.test/catalog.json';
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async () => response(fixture.catalog),
+        });
+        const source = await manager.addSource({ url: sourceUrl });
+        const trusted = clone(manager.readState().sources[source.id]);
+        let refreshCall = 0;
+        let firstRefreshStarted;
+        const firstRefreshStartedGate = new Promise((resolve) => {
+            firstRefreshStarted = resolve;
+        });
+        let releaseFirstRefresh;
+        const firstRefreshGate = new Promise((resolve) => {
+            releaseFirstRefresh = resolve;
+        });
+        manager._loadCommunitySource = async () => {
+            refreshCall += 1;
+            if (refreshCall === 1) {
+                firstRefreshStarted();
+                await firstRefreshGate;
+                const error = new Error('catalog offline');
+                error.code = 'EXTENSION_SOURCE_FETCH_FAILED';
+                throw error;
+            }
+            return {
+                url: trusted.url,
+                verified: trusted.verified,
+                verificationMode: trusted.verificationMode,
+                digest: trusted.digest,
+                publisher: clone(trusted.publisher),
+                entries: clone(trusted.entries),
+                sequence: trusted.sequence,
+                generatedAt: trusted.generatedAt,
+                expiresAt: trusted.expiresAt,
+                headers: clone(trusted.headers),
+            };
+        };
+
+        const olderRefresh = manager.refreshSource(source.id);
+        await firstRefreshStartedGate;
+        await manager.refreshSource(source.id);
+        releaseFirstRefresh();
+
+        let refreshError;
+        try {
+            await olderRefresh;
+        } catch (error) {
+            refreshError = error;
+        }
+
+        expect(refreshError).to.include({
+            code: 'EXTENSION_SOURCE_FETCH_FAILED',
+        });
+        expect(refreshError.source).to.include({
+            status: 'ready',
+            lastError: null,
+        });
+        expect(manager.getSources()[0]).to.include({
+            status: 'ready',
+            lastError: null,
+        });
+    });
+
+    it('does not let an older successful refresh overwrite a newer successful refresh with the same sequence', async function () {
+        const fixture = contentFixture();
+        const sourceUrl = 'https://example.test/catalog.json';
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async () => response(fixture.catalog),
+        });
+        const source = await manager.addSource({ url: sourceUrl });
+        const trusted = clone(manager.readState().sources[source.id]);
+        let refreshCall = 0;
+        let firstRefreshStarted;
+        const firstRefreshStartedGate = new Promise((resolve) => {
+            firstRefreshStarted = resolve;
+        });
+        let releaseFirstRefresh;
+        const firstRefreshGate = new Promise((resolve) => {
+            releaseFirstRefresh = resolve;
+        });
+        manager._loadCommunitySource = async () => {
+            refreshCall += 1;
+            const loaded = {
+                url: trusted.url,
+                verified: trusted.verified,
+                verificationMode: trusted.verificationMode,
+                publisher: clone(trusted.publisher),
+                entries: clone(trusted.entries),
+                sequence: trusted.sequence,
+                generatedAt: trusted.generatedAt,
+                expiresAt: trusted.expiresAt,
+                headers: clone(trusted.headers),
+                digest: refreshCall === 1 ? 'older-digest' : 'newer-digest',
+            };
+            if (refreshCall === 1) {
+                firstRefreshStarted();
+                await firstRefreshGate;
+            }
+            return loaded;
+        };
+
+        const olderRefresh = manager.refreshSource(source.id);
+        await firstRefreshStartedGate;
+        await manager.refreshSource(source.id);
+        releaseFirstRefresh();
+
+        let refreshError;
+        try {
+            await olderRefresh;
+        } catch (error) {
+            refreshError = error;
+        }
+
+        expect(refreshError).to.include({
+            code: 'EXTENSION_CONSISTENCY_CONFLICT',
+        });
+        expect(manager.readState().sources[source.id]).to.include({
+            status: 'ready',
+            digest: 'newer-digest',
+        });
+    });
+
+    it('does not let an older source add overwrite a newer request for the same URL', async function () {
+        const fixture = contentFixture();
+        const sourceUrl = 'https://example.test/catalog.json';
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async () => response(fixture.catalog),
+        });
+        let addCall = 0;
+        let firstAddStarted;
+        const firstAddStartedGate = new Promise((resolve) => {
+            firstAddStarted = resolve;
+        });
+        let releaseFirstAdd;
+        const firstAddGate = new Promise((resolve) => {
+            releaseFirstAdd = resolve;
+        });
+        manager._loadCommunitySource = async (url, sourceId) => {
+            const call = ++addCall;
+            const loaded = normalizeCommunityCatalog(
+                clone(fixture.catalog),
+                url,
+                sourceId,
+            );
+            if (call === 1) {
+                firstAddStarted();
+                await firstAddGate;
+            }
+            return {
+                ...loaded,
+                url,
+                digest: call === 1 ? 'older-digest' : 'newer-digest',
+                headers: {},
+                verified: true,
+                verificationMode: 'community-integrity',
+            };
+        };
+
+        const olderAdd = manager.addSource({
+            url: sourceUrl,
+            name: 'Older name',
+            idempotencyKey: 'older-request',
+        });
+        await firstAddStartedGate;
+        await manager.addSource({
+            url: sourceUrl,
+            name: 'Newer name',
+            idempotencyKey: 'newer-request',
+        });
+        releaseFirstAdd();
+
+        let addError;
+        try {
+            await olderAdd;
+        } catch (error) {
+            addError = error;
+        }
+
+        expect(addError).to.include({
+            code: 'EXTENSION_CONSISTENCY_CONFLICT',
+        });
+        expect(manager.readState().sources[extensionSourceId(sourceUrl)]).to.include(
+            {
+                name: 'Newer name',
+                digest: 'newer-digest',
+                lastIdempotencyKey: 'newer-request',
+            },
+        );
+    });
+
+    it('does not let a refresh from a removed source instance affect a re-added source', async function () {
+        const fixture = contentFixture();
+        const sourceUrl = 'https://example.test/catalog.json';
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async () => response(fixture.catalog),
+        });
+        const source = await manager.addSource({ url: sourceUrl });
+        const trusted = clone(manager.readState().sources[source.id]);
+        let loadCall = 0;
+        let refreshStarted;
+        const refreshStartedGate = new Promise((resolve) => {
+            refreshStarted = resolve;
+        });
+        let releaseRefresh;
+        const refreshGate = new Promise((resolve) => {
+            releaseRefresh = resolve;
+        });
+        manager._loadCommunitySource = async () => {
+            loadCall += 1;
+            if (loadCall === 1) {
+                refreshStarted();
+                await refreshGate;
+                const error = new Error('removed source request failed');
+                error.code = 'EXTENSION_SOURCE_FETCH_FAILED';
+                throw error;
+            }
+            return {
+                url: trusted.url,
+                verified: trusted.verified,
+                verificationMode: trusted.verificationMode,
+                digest: 're-added-digest',
+                publisher: clone(trusted.publisher),
+                entries: clone(trusted.entries),
+                sequence: trusted.sequence,
+                generatedAt: trusted.generatedAt,
+                expiresAt: trusted.expiresAt,
+                headers: clone(trusted.headers),
+            };
+        };
+
+        const staleRefresh = manager.refreshSource(source.id);
+        await refreshStartedGate;
+        manager.removeSource(source.id);
+        const readded = await manager.addSource({
+            url: sourceUrl,
+            name: 'Re-added source',
+        });
+        releaseRefresh();
+
+        let refreshError;
+        try {
+            await staleRefresh;
+        } catch (error) {
+            refreshError = error;
+        }
+
+        expect(refreshError).to.include({
+            code: 'EXTENSION_SOURCE_FETCH_FAILED',
+        });
+        expect(refreshError.source).to.include({
+            name: 'Re-added source',
+            status: 'ready',
+            lastError: null,
+        });
+        expect(manager.readState().sources[readded.id]).to.include({
+            name: 'Re-added source',
+            status: 'ready',
+            digest: 're-added-digest',
+            lastError: null,
+        });
+    });
+
+    it('refreshes trusted sources for discovery without writing unchanged snapshots', async function () {
+        const fixture = contentFixture();
+        const sourceUrl = 'https://example.test/catalog.json';
+        let activeCatalog = clone(fixture.catalog);
+        let fetchCount = 0;
+        let releaseFetch;
+        const fetchGate = new Promise((resolve) => {
+            releaseFetch = resolve;
+        });
+        let gateEnabled = false;
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async () => {
+                fetchCount += 1;
+                if (gateEnabled) await fetchGate;
+                return response(activeCatalog);
+            },
+        });
+        await manager.addSource({ url: sourceUrl });
+        const initialRevision = manager.getRuntimeManifest().revision;
+
+        const unchanged = await manager.refreshSourcesForDiscovery();
+        expect(unchanged.changed).to.equal(false);
+        expect(manager.getRuntimeManifest().revision).to.equal(
+            initialRevision,
+        );
+
+        activeCatalog = clone(activeCatalog);
+        activeCatalog.sequence = Number(activeCatalog.sequence || 0) + 1;
+        activeCatalog.entries[0].manifest.version = '1.1.0';
+        activeCatalog.entries[0].version = '1.1.0';
+        gateEnabled = true;
+        const firstRefresh = manager.refreshSourcesForDiscovery({
+            force: true,
+        });
+        const secondRefresh = manager.refreshSourcesForDiscovery({
+            force: true,
+        });
+        releaseFetch();
+        const [first, second] = await Promise.all([
+            firstRefresh,
+            secondRefresh,
+        ]);
+
+        expect(first.changed).to.equal(true);
+        expect(second).to.deep.equal(first);
+        expect(fetchCount).to.equal(3);
+        expect(manager.getRuntimeManifest().revision).to.equal(
+            initialRevision + 1,
+        );
+        expect(
+            manager
+                .getCatalog()
+                .entries.find((entry) => entry.id === fixture.manifest.id)
+                .availableVersion,
+        ).to.equal('1.1.0');
+    });
+
+    it('marks an installed extension update as available after discovery refresh', async function () {
+        const v1 = contentFixture({ version: '1.0.0' });
+        const v2 = contentFixture({ version: '1.1.0' });
+        const sourceUrl = 'https://example.test/catalog.json';
+        let activeCatalog = clone(v1.catalog);
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async (url) =>
+                response(
+                    url === sourceUrl
+                        ? activeCatalog
+                        : url === v1.catalog.entries[0].packageUrls.node
+                        ? v1.packageDocument
+                        : v2.packageDocument,
+                ),
+        });
+        await manager.addSource({ url: sourceUrl });
+        await manager.installFromSource(v1.manifest.id);
+        expect(
+            manager
+                .getCatalog()
+                .entries.find((entry) => entry.id === v1.manifest.id)
+                .updateAvailable,
+        ).to.equal(false);
+
+        activeCatalog = clone(v2.catalog);
+        activeCatalog.entries[0].releases = [clone(v1.catalog.entries[0])];
+        await manager.refreshSourcesForDiscovery();
+
+        expect(
+            manager
+                .getCatalog()
+                .entries.find((entry) => entry.id === v1.manifest.id),
+        ).to.include({
+            installedVersion: '1.0.0',
+            availableVersion: '1.1.0',
+            updateAvailable: true,
+        });
+    });
+
+    it('does not overwrite a newer source state committed during discovery refresh', async function () {
+        const v1 = contentFixture({ version: '1.0.0' });
+        const v2 = contentFixture({ version: '1.1.0' });
+        const v3 = contentFixture({ version: '1.2.0' });
+        const sourceUrl = 'https://example.test/catalog.json';
+        let activeCatalog = clone(v1.catalog);
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async () => response(activeCatalog),
+        });
+        const source = await manager.addSource({ url: sourceUrl });
+        activeCatalog = clone(v2.catalog);
+        const newerCatalog = clone(v3.catalog);
+        const newerSource = normalizeCommunityCatalog(
+            newerCatalog,
+            sourceUrl,
+            source.id,
+        );
+        const originalCommit = manager._commit.bind(manager);
+        let injected = false;
+        manager._commit = (mutator, options) => {
+            if (!injected) {
+                injected = true;
+                originalCommit((state) => {
+                    Object.assign(state.sources[source.id], {
+                        status: 'ready',
+                        digest: sha256Hex(JSON.stringify(newerCatalog)),
+                        entries: clone(newerSource.entries),
+                        sequence: newerSource.sequence,
+                        generatedAt: newerSource.generatedAt,
+                        expiresAt: newerSource.expiresAt,
+                        updatedAt: Date.now(),
+                        lastError: null,
+                    });
+                    return state;
+                });
+            }
+            return originalCommit(mutator, options);
+        };
+
+        const result = await manager.refreshSourcesForDiscovery();
+
+        expect(result.changed).to.equal(false);
+        expect(
+            manager
+                .getCatalog()
+                .entries.find((entry) => entry.id === v1.manifest.id)
+                .availableVersion,
+        ).to.equal('1.2.0');
+    });
+
+    it('does not commit a stale discovery result after its source is removed', async function () {
+        const v1 = contentFixture({ version: '1.0.0' });
+        const v2 = contentFixture({ version: '1.1.0' });
+        const sourceUrl = 'https://example.test/catalog.json';
+        let activeCatalog = clone(v1.catalog);
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async () => response(activeCatalog),
+        });
+        const source = await manager.addSource({ url: sourceUrl });
+        activeCatalog = clone(v2.catalog);
+        const originalCommit = manager._commit.bind(manager);
+        let injected = false;
+        manager._commit = (mutator, options) => {
+            if (!injected) {
+                injected = true;
+                originalCommit((state) => {
+                    delete state.sources[source.id];
+                    return state;
+                });
+            }
+            return originalCommit(mutator, options);
+        };
+
+        const result = await manager.refreshSourcesForDiscovery();
+
+        expect(result.changed).to.equal(false);
+        expect(manager.getSources()).to.deep.equal([]);
+        expect(manager.getRuntimeManifest().revision).to.equal(2);
+    });
+
+    it('recomputes a discovery refresh after an unrelated concurrent commit', async function () {
+        const v1 = contentFixture({ version: '1.0.0' });
+        const v2 = contentFixture({ version: '1.1.0' });
+        const sourceUrl = 'https://example.test/catalog.json';
+        let activeCatalog = clone(v1.catalog);
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async () => response(activeCatalog),
+        });
+        await manager.addSource({ url: sourceUrl });
+        activeCatalog = clone(v2.catalog);
+        const originalCommit = manager._commit.bind(manager);
+        let injected = false;
+        manager._commit = (mutator, options) => {
+            if (!injected) {
+                injected = true;
+                originalCommit((state) => {
+                    state.migrations.concurrentDiscoveryCheck = {
+                        completedAt: Date.now(),
+                    };
+                    return state;
+                });
+            }
+            return originalCommit(mutator, options);
+        };
+
+        const result = await manager.refreshSourcesForDiscovery();
+
+        expect(result.changed).to.equal(true);
+        expect(manager.getRuntimeManifest().revision).to.equal(3);
+        expect(
+            manager
+                .getCatalog()
+                .entries.find((entry) => entry.id === v1.manifest.id)
+                .availableVersion,
+        ).to.equal('1.1.0');
+    });
+
+    it('preserves a concurrent source rename while applying its remote update', async function () {
+        const v1 = contentFixture({ version: '1.0.0' });
+        const v2 = contentFixture({ version: '1.1.0' });
+        const sourceUrl = 'https://example.test/catalog.json';
+        let activeCatalog = clone(v1.catalog);
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async () => response(activeCatalog),
+        });
+        const source = await manager.addSource({
+            url: sourceUrl,
+            name: 'Original name',
+        });
+        activeCatalog = clone(v2.catalog);
+        const originalCommit = manager._commit.bind(manager);
+        let injected = false;
+        manager._commit = (mutator, options) => {
+            if (!injected) {
+                injected = true;
+                originalCommit((state) => {
+                    state.sources[source.id].name = 'Renamed source';
+                    state.sources[source.id].updatedAt = Date.now();
+                    return state;
+                });
+            }
+            return originalCommit(mutator, options);
+        };
+
+        const result = await manager.refreshSourcesForDiscovery();
+
+        expect(result.changed).to.equal(true);
+        expect(manager.getSources()[0].name).to.equal('Renamed source');
+        expect(
+            manager
+                .getCatalog()
+                .entries.find((entry) => entry.id === v1.manifest.id)
+                .availableVersion,
+        ).to.equal('1.1.0');
+    });
+
+    it('detects a source id conflict introduced during discovery refresh', async function () {
+        const firstFixture = contentFixture({ version: '1.0.0' });
+        const secondFixture = contentFixture({ version: '1.0.0' });
+        secondFixture.manifest.id = 'com.example.second-content-extension';
+        secondFixture.catalog.entries[0].id = secondFixture.manifest.id;
+        secondFixture.catalog.entries[0].manifest.id = secondFixture.manifest.id;
+        const firstUrl = 'https://example.test/first.json';
+        const secondUrl = 'https://example.test/second.json';
+        let firstCatalog = clone(firstFixture.catalog);
+        const secondCatalog = clone(secondFixture.catalog);
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async (url) =>
+                response(url === firstUrl ? firstCatalog : secondCatalog),
+        });
+        const firstSource = await manager.addSource({ url: firstUrl });
+        const secondSource = await manager.addSource({ url: secondUrl });
+        firstCatalog = clone(firstCatalog);
+        firstCatalog.sequence = Number(firstCatalog.sequence || 0) + 1;
+        firstCatalog.entries[0].manifest.version = '1.1.0';
+        firstCatalog.entries[0].version = '1.1.0';
+        const originalCommit = manager._commit.bind(manager);
+        let injected = false;
+        manager._commit = (mutator, options) => {
+            if (!injected) {
+                injected = true;
+                originalCommit((state) => {
+                    state.sources[secondSource.id].entries = clone(
+                        state.sources[firstSource.id].entries,
+                    );
+                    state.sources[secondSource.id].updatedAt = Date.now();
+                    return state;
+                });
+            }
+            return originalCommit(mutator, options);
+        };
+
+        let refreshError;
+        try {
+            await manager.refreshSourcesForDiscovery();
+        } catch (error) {
+            refreshError = error;
+        }
+
+        expect(refreshError).to.include({
+            code: 'EXTENSION_SOURCE_ID_CONFLICT',
+        });
+        expect(manager.getRuntimeManifest().revision).to.equal(3);
+        expect(
+            manager
+                .getCatalog()
+                .entries.find((entry) => entry.id === firstFixture.manifest.id)
+                .availableVersion,
+        ).to.equal('1.0.0');
+    });
+
+    it('keeps failed source entries trusted while applying other discovery updates once', async function () {
+        const firstFixture = contentFixture({ version: '1.0.0' });
+        const secondFixture = contentFixture({ version: '1.0.0' });
+        secondFixture.manifest.id = 'com.example.second-content-extension';
+        secondFixture.catalog.entries[0].id = secondFixture.manifest.id;
+        secondFixture.catalog.entries[0].manifest.id = secondFixture.manifest.id;
+        const firstUrl = 'https://example.test/first.json';
+        const secondUrl = 'https://example.test/second.json';
+        const firstCatalog = clone(firstFixture.catalog);
+        let secondCatalog = clone(secondFixture.catalog);
+        let firstOffline = false;
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async (url) => {
+                if (url === firstUrl && firstOffline) {
+                    throw new Error('first catalog offline');
+                }
+                return response(url === firstUrl ? firstCatalog : secondCatalog);
+            },
+        });
+        await manager.addSource({ url: firstUrl });
+        await manager.addSource({ url: secondUrl });
+        const initialRevision = manager.getRuntimeManifest().revision;
+
+        firstOffline = true;
+        secondCatalog = clone(secondCatalog);
+        secondCatalog.entries[0].manifest.version = '1.1.0';
+        secondCatalog.entries[0].version = '1.1.0';
+        const result = await manager.refreshSourcesForDiscovery();
+
+        expect(result).to.include({
+            changed: true,
+            successCount: 1,
+            failureCount: 1,
+        });
+        expect(manager.getRuntimeManifest().revision).to.equal(
+            initialRevision + 1,
+        );
+        const sources = manager.getSources();
+        expect(sources.find((source) => source.url === firstUrl)).to.include({
+            status: 'ready',
+            entryCount: 1,
+        });
+        expect(
+            manager
+                .getCatalog()
+                .entries.find(
+                    (entry) => entry.id === secondFixture.manifest.id,
+                ).availableVersion,
+        ).to.equal('1.1.0');
+    });
+
+    it('caches automatic discovery checks without persisting transient failures', async function () {
+        const fixture = contentFixture();
+        const sourceUrl = 'https://example.test/catalog.json';
+        let fetchCount = 0;
+        let offline = false;
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async () => {
+                fetchCount += 1;
+                if (offline) throw new Error('catalog offline');
+                return response(fixture.catalog);
+            },
+        });
+        await manager.addSource({ url: sourceUrl });
+        const initialRevision = manager.getRuntimeManifest().revision;
+
+        const first = await manager.refreshSourcesForDiscovery();
+        const cached = await manager.refreshSourcesForDiscovery();
+        expect(first.cached).to.equal(undefined);
+        expect(cached.cached).to.equal(true);
+        expect(fetchCount).to.equal(2);
+
+        offline = true;
+        const forced = await manager.refreshSourcesForDiscovery({
+            force: true,
+        });
+        expect(forced).to.include({
+            changed: false,
+            successCount: 0,
+            failureCount: 1,
+        });
+        expect(forced.items[0]).to.deep.include({
+            status: 'error',
+            error: {
+                code: 'EXTENSION_SOURCE_FETCH_FAILED',
+                message: 'Extension source could not be fetched',
+            },
+        });
+        expect(manager.getRuntimeManifest().revision).to.equal(
+            initialRevision,
+        );
+        expect(manager.getSources()[0]).to.include({
+            status: 'ready',
+            entryCount: 1,
+        });
+    });
+
+    it('limits the number of configured community sources', async function () {
+        const fixture = contentFixture();
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async (url) => {
+                const catalog = clone(fixture.catalog);
+                const suffix = `${url}`.match(/catalog-(\d+)\.json$/)?.[1];
+                const id = `com.example.source-limit-${suffix || 'overflow'}`;
+                catalog.entries[0].id = id;
+                catalog.entries[0].manifest.id = id;
+                return response(catalog);
+            },
+        });
+
+        for (let index = 0; index < 32; index += 1) {
+            await manager.addSource({
+                url: `https://example.test/catalog-${index}.json`,
+            });
+        }
+
+        let error;
+        try {
+            await manager.addSource({
+                url: 'https://example.test/catalog-over-limit.json',
+            });
+        } catch (caught) {
+            error = caught;
+        }
+        expect(error).to.include({
+            code: 'EXTENSION_SOURCE_LIMIT_REACHED',
+        });
+        expect(error.details).to.deep.equal({ maxSources: 32 });
+    });
+
+    it('enforces the community source limit when additions finish concurrently', async function () {
+        const fixture = contentFixture();
+        const pendingLoads = [];
+        let releaseLoads;
+        const loadGate = new Promise((resolve) => {
+            releaseLoads = resolve;
+        });
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async (url) => {
+                const catalog = clone(fixture.catalog);
+                const suffix = `${url}`.match(/catalog-(\d+)\.json$/)?.[1];
+                const id = `com.example.concurrent-source-limit-${suffix}`;
+                catalog.entries[0].id = id;
+                catalog.entries[0].manifest.id = id;
+                if (Number(suffix) >= 31) {
+                    pendingLoads.push(url);
+                    if (pendingLoads.length === 2) releaseLoads();
+                    await loadGate;
+                }
+                return response(catalog);
+            },
+        });
+
+        for (let index = 0; index < 31; index += 1) {
+            await manager.addSource({
+                url: `https://example.test/catalog-${index}.json`,
+            });
+        }
+
+        const results = await Promise.allSettled([
+            manager.addSource({
+                url: 'https://example.test/catalog-31.json',
+            }),
+            manager.addSource({
+                url: 'https://example.test/catalog-32.json',
+            }),
+        ]);
+
+        expect(manager.getSources()).to.have.length(32);
+        expect(results.filter((result) => result.status === 'fulfilled')).to
+            .have.length(1);
+        const rejected = results.find(
+            (result) => result.status === 'rejected',
+        );
+        expect(rejected.reason).to.include({
+            code: 'EXTENSION_SOURCE_LIMIT_REACHED',
+        });
+        expect(rejected.reason.details).to.deep.equal({ maxSources: 32 });
     });
 
     it('lets a verified source replace a removed local installation while retaining its data', async function () {
@@ -1886,6 +2998,150 @@ module.exports = Object.freeze({
             error = caught;
         }
         expect(error).to.have.property('code', 'EXTENSION_SOURCE_ID_CONFLICT');
+    });
+
+    it('rejects duplicate community extension ids added concurrently', async function () {
+        const fixture = contentFixture();
+        let pendingLoads = 0;
+        let releaseLoads;
+        const loadGate = new Promise((resolve) => {
+            releaseLoads = resolve;
+        });
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async () => {
+                pendingLoads += 1;
+                if (pendingLoads === 2) releaseLoads();
+                await loadGate;
+                return response(fixture.catalog);
+            },
+        });
+
+        const results = await Promise.allSettled([
+            manager.addSource({ url: 'https://example.test/one.json' }),
+            manager.addSource({ url: 'https://example.test/two.json' }),
+        ]);
+
+        expect(manager.getSources()).to.have.length(1);
+        expect(results.filter((result) => result.status === 'fulfilled')).to
+            .have.length(1);
+        const rejected = results.find(
+            (result) => result.status === 'rejected',
+        );
+        expect(rejected.reason).to.have.property(
+            'code',
+            'EXTENSION_SOURCE_ID_CONFLICT',
+        );
+    });
+
+    it('rejects duplicate extension ids produced by concurrent source refreshes', async function () {
+        const firstFixture = contentFixture();
+        const secondFixture = contentFixture();
+        secondFixture.manifest.id = 'com.example.second-content-extension';
+        secondFixture.catalog.entries[0].id = secondFixture.manifest.id;
+        secondFixture.catalog.entries[0].manifest.id =
+            secondFixture.manifest.id;
+        const firstUrl = 'https://example.test/first.json';
+        const secondUrl = 'https://example.test/second.json';
+        const initialCatalogs = {
+            [firstUrl]: clone(firstFixture.catalog),
+            [secondUrl]: clone(secondFixture.catalog),
+        };
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async (url) => response(initialCatalogs[url]),
+        });
+        const firstSource = await manager.addSource({ url: firstUrl });
+        const secondSource = await manager.addSource({ url: secondUrl });
+        let readyCount = 0;
+        let releaseLoads;
+        const loadGate = new Promise((resolve) => {
+            releaseLoads = resolve;
+        });
+        manager._loadCommunitySource = async (url, sourceId) => {
+            const catalog = clone(initialCatalogs[url]);
+            catalog.entries[0].id = 'com.example.concurrent-shared';
+            catalog.entries[0].manifest.id =
+                'com.example.concurrent-shared';
+            const loaded = normalizeCommunityCatalog(catalog, url, sourceId);
+            manager._assertCommunityIdAvailable(loaded.entries, sourceId);
+            readyCount += 1;
+            if (readyCount === 2) releaseLoads();
+            await loadGate;
+            return {
+                ...loaded,
+                url,
+                digest: sha256Hex(JSON.stringify(catalog)),
+                headers: {},
+                verified: true,
+                verificationMode: 'community-integrity',
+            };
+        };
+
+        const results = await Promise.allSettled([
+            manager.refreshSource(firstSource.id),
+            manager.refreshSource(secondSource.id),
+        ]);
+
+        expect(results.filter((result) => result.status === 'fulfilled')).to
+            .have.length(1);
+        const rejected = results.find(
+            (result) => result.status === 'rejected',
+        );
+        expect(rejected.reason).to.have.property(
+            'code',
+            'EXTENSION_SOURCE_ID_CONFLICT',
+        );
+        const sharedEntries = manager
+            .getSources()
+            .flatMap((sourceItem) => sourceItem.entries)
+            .filter((entry) => entry.id === 'com.example.concurrent-shared');
+        expect(sharedEntries).to.have.length(1);
+    });
+
+    it('rechecks built-in extension ids when a source add commits', async function () {
+        const fixture = contentFixture();
+        let releaseLoad;
+        const loadGate = new Promise((resolve) => {
+            releaseLoad = resolve;
+        });
+        const manager = new ExtensionManager({
+            store: createStore(undefined),
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async () => {
+                await loadGate;
+                return response(fixture.catalog);
+            },
+        });
+
+        const pending = manager.addSource({
+            url: 'https://example.test/catalog.json',
+        });
+        manager.bundledCatalog.push({
+            id: fixture.manifest.id,
+            manifest: clone(fixture.manifest),
+            distribution: 'bundled',
+            source: 'runtime-bundled',
+        });
+        releaseLoad();
+
+        let error;
+        try {
+            await pending;
+        } catch (caught) {
+            error = caught;
+        }
+
+        expect(error).to.have.property(
+            'code',
+            'EXTENSION_SOURCE_ID_RESERVED',
+        );
+        expect(manager.getSources()).to.deep.equal([]);
     });
 
     it('verifies file digests and receipt closure without a package store', async function () {
