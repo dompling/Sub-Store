@@ -34,6 +34,7 @@ import { applyAgeOutputEncryption } from '@/restful/age-output';
 import { maskAgeSecretInUrl } from '@/utils/age';
 import { isMihomoConfigFile, normalizeFileConfig } from '@/utils/file-type';
 import { getArtifactSourceAdapter } from '@/extensions/registry';
+import { formatErrorReason } from '@/utils/error-reason';
 import '@/extensions/bundled';
 
 export default function register($app) {
@@ -964,6 +965,39 @@ async function produceArtifact(input) {
     });
 }
 
+function resolveArtifactSourcePlatform(adapter, platform) {
+    const supportedPlatforms = [
+        ...new Set(
+            (Array.isArray(adapter?.platforms) ? adapter.platforms : [])
+                .filter((candidate) => typeof candidate === 'string')
+                .map((candidate) => candidate.trim())
+                .filter(Boolean),
+        ),
+    ];
+    if (supportedPlatforms.length === 0) return platform;
+
+    const requestedPlatform = `${platform || ''}`.trim();
+    if (supportedPlatforms.includes(requestedPlatform)) {
+        return requestedPlatform;
+    }
+    if (!requestedPlatform || requestedPlatform === 'Stash') {
+        return supportedPlatforms[0];
+    }
+
+    const error = new Error(
+        `Artifact source ${
+            adapter.type || 'extension'
+        } does not support ${requestedPlatform}`,
+    );
+    error.code = 'UNSUPPORTED_ARTIFACT_PLATFORM';
+    error.details = {
+        artifactType: adapter.type || null,
+        requestedPlatform,
+        supportedPlatforms,
+    };
+    throw error;
+}
+
 function createArtifactUploadBatches(names, batchSize) {
     const batches = [];
     for (let index = 0; index < names.length; index += batchSize) {
@@ -1041,10 +1075,19 @@ function findArtifactSourceConfig(artifact) {
 
 async function produceSyncArtifactOutput(artifact) {
     const useMihomoExternal = artifact.platform === 'SurgeMac';
+    const adapter = getArtifactSourceAdapter(artifact.type);
+    const platform = adapter
+        ? resolveArtifactSourcePlatform(adapter, artifact.platform)
+        : artifact.platform;
+    if (artifact.platform && platform !== artifact.platform) {
+        $.info(
+            `扩展来源 ${artifact.type} 不支持历史默认目标 ${artifact.platform}, 使用 ${platform}`,
+        );
+    }
     const output = await produceArtifact({
         type: artifact.type,
         name: artifact.source,
-        platform: artifact.platform,
+        platform,
         produceOpts: {
             'include-unsupported-proxy': artifact.includeUnsupportedProxy,
             useMihomoExternal,
@@ -1140,12 +1183,13 @@ async function uploadArtifactBatches({ allArtifacts, files, valid, invalid }) {
                 }
             }
         } catch (e) {
+            const reason = formatErrorReason(e);
             $.error(
                 `第 ${index + 1}/${
                     batches.length
-                } 批同步配置上传失败: ${batchNames.join(', ')}, 原因: ${
-                    e.message ?? e
-                }`,
+                } 批同步配置上传失败: ${batchNames.join(
+                    ', ',
+                )}, 原因: ${reason}`,
             );
             invalid.push(...batchNames);
         }
@@ -1258,10 +1302,11 @@ async function syncArtifacts(options = {}) {
                         }
                     }
                 } catch (e) {
+                    const reason = formatErrorReason(e);
                     $.error(
                         `生成同步配置 ${formatArtifactLogName(
                             artifact,
-                        )} 发生错误: ${e.message ?? e}`,
+                        )} 发生错误: ${reason}`,
                     );
                     invalid.push(artifact.name);
                 }
@@ -1313,7 +1358,7 @@ async function syncArtifacts(options = {}) {
             );
         }
     } catch (e) {
-        $.error(`同步配置失败，原因：${e.message ?? e}`);
+        $.error(`同步配置失败，原因：${formatErrorReason(e)}`);
         throw e;
     }
 }
@@ -1323,13 +1368,14 @@ async function syncAllArtifacts(_, res) {
         await syncArtifacts();
         success(res);
     } catch (e) {
-        $.error(`同步配置失败，原因：${e.message ?? e}`);
+        const reason = formatErrorReason(e);
+        $.error(`同步配置失败，原因：${reason}`);
         failed(
             res,
             new InternalServerError(
                 `FAILED_TO_SYNC_ARTIFACTS`,
                 `Failed to sync all artifacts`,
-                `Reason: ${e.message ?? e}`,
+                `Reason: ${reason}`,
             ),
         );
     }
@@ -1432,7 +1478,8 @@ async function syncArtifact(req, res) {
         const artifact = await syncArtifactItem(name);
         success(res, artifact);
     } catch (err) {
-        $.error(`远程配置 ${name} 发生错误: ${err.message ?? err}`);
+        const reason = formatErrorReason(err);
+        $.error(`远程配置 ${name} 发生错误: ${reason}`);
         failed(
             res,
             err instanceof ResourceNotFoundError
@@ -1440,7 +1487,7 @@ async function syncArtifact(req, res) {
                 : new InternalServerError(
                       `FAILED_TO_SYNC_ARTIFACT`,
                       `Failed to sync artifact ${name}`,
-                      `Reason: ${err}`,
+                      `Reason: ${reason}`,
                   ),
             err instanceof ResourceNotFoundError ? 404 : undefined,
         );
@@ -1453,6 +1500,7 @@ export {
     produceArtifact,
     produceBuiltinArtifact,
     produceSyncArtifactOutput,
+    resolveArtifactSourcePlatform,
     resolveFileRawContent,
     shouldUploadArtifact,
     syncArtifactItem,

@@ -7,10 +7,13 @@ let $;
 let registerArtifactRoutes;
 let registerSyncRoutes;
 let produceSyncArtifactOutput;
+let resolveArtifactSourcePlatform;
 let originalError;
 let originalInfo;
 let originalRead;
 let originalWrite;
+let extensionRegistry;
+let originalGetArtifactSourceAdapter;
 let state;
 let ageUtils;
 
@@ -104,9 +107,14 @@ describe('sync routes', function () {
     before(async function () {
         ({ default: $ } = require('@/core/app'));
         ({ default: registerArtifactRoutes } = require('@/restful/artifacts'));
-        ({ default: registerSyncRoutes, produceSyncArtifactOutput } = require(
-            '@/restful/sync'
-        ));
+        ({
+            default: registerSyncRoutes,
+            produceSyncArtifactOutput,
+            resolveArtifactSourcePlatform,
+        } = require('@/restful/sync'));
+        extensionRegistry = require('@/extensions/registry');
+        originalGetArtifactSourceAdapter =
+            extensionRegistry.getArtifactSourceAdapter;
         ageUtils = require('@/utils/age');
 
         originalRead = $.read.bind($);
@@ -121,6 +129,10 @@ describe('sync routes', function () {
             $.write = originalWrite;
             $.info = originalInfo;
             $.error = originalError;
+        }
+        if (extensionRegistry) {
+            extensionRegistry.getArtifactSourceAdapter =
+                originalGetArtifactSourceAdapter;
         }
     });
 
@@ -267,6 +279,133 @@ describe('sync routes', function () {
             throw new Error('Expected source key decrypt to fail');
         } catch (e) {
             expect(e.message).to.contain('age 解密失败');
+        }
+    });
+
+    it('uses the first declared extension platform for the legacy hidden Stash default', async function () {
+        let producerInput;
+        const adapter = {
+            type: 'config-project',
+            platforms: ['Surge', 'QX', 'Clash', 'Loon'],
+            findSourceConfig: () => null,
+            produce: async (input) => {
+                producerInput = input;
+                return '[General]\nloglevel = notify';
+            },
+        };
+        extensionRegistry.getArtifactSourceAdapter = (type) =>
+            type === adapter.type
+                ? adapter
+                : originalGetArtifactSourceAdapter(type);
+
+        try {
+            const artifact = {
+                name: 'config-project-artifact',
+                type: 'config-project',
+                source: 'demo-project',
+                platform: 'Stash',
+                upload: false,
+            };
+
+            const output = await produceSyncArtifactOutput(artifact);
+
+            expect(output).to.equal('[General]\nloglevel = notify');
+            expect(producerInput.platform).to.equal('Surge');
+        } finally {
+            extensionRegistry.getArtifactSourceAdapter =
+                originalGetArtifactSourceAdapter;
+        }
+    });
+
+    it('rejects explicit unsupported extension platforms instead of silently changing them', function () {
+        let error;
+        try {
+            resolveArtifactSourcePlatform(
+                {
+                    type: 'config-project',
+                    platforms: ['Surge', 'QX', 'Clash', 'Loon'],
+                },
+                'ShadowRocket',
+            );
+        } catch (cause) {
+            error = cause;
+        }
+
+        expect(error).to.include({
+            code: 'UNSUPPORTED_ARTIFACT_PLATFORM',
+        });
+        expect(error.message).to.contain('config-project');
+        expect(error.message).to.contain('ShadowRocket');
+        expect(error.details.supportedPlatforms).to.deep.equal([
+            'Surge',
+            'QX',
+            'Clash',
+            'Loon',
+        ]);
+    });
+
+    it('returns readable structured error details instead of object coercion', async function () {
+        state[ARTIFACTS_KEY][0]['age-public-key'] = 'invalid-age-key';
+
+        const res = await requestSyncArtifact('local-artifact');
+
+        expect(res.statusCode).to.equal(500);
+        expect(res.body.error.code).to.equal('FAILED_TO_SYNC_ARTIFACT');
+        expect(res.body.error.details).to.contain('INVALID_AGE_PUBLIC_KEY');
+        expect(res.body.error.details).to.contain(
+            'age-public-key 仅支持 X25519',
+        );
+        expect(res.body.error.details).to.not.contain('[object Object]');
+    });
+
+    it('redacts sensitive structured error details', async function () {
+        const adapter = {
+            type: 'config-project',
+            platforms: ['Surge'],
+            findSourceConfig: () => null,
+            produce: async () => {
+                throw {
+                    code: 'CONFIG_GENERATOR_REMOTE_FAILURE',
+                    message: 'Remote generation failed',
+                    details: {
+                        token: 'super-secret-token',
+                        publicKey: 'age1sensitive',
+                        endpoint: 'https://example.com/config',
+                    },
+                };
+            },
+        };
+        extensionRegistry.getArtifactSourceAdapter = (type) =>
+            type === adapter.type
+                ? adapter
+                : originalGetArtifactSourceAdapter(type);
+        state[ARTIFACTS_KEY][0] = {
+            name: 'config-project-artifact',
+            type: 'config-project',
+            source: 'demo-project',
+            platform: 'Surge',
+            upload: false,
+        };
+
+        try {
+            const res = await requestSyncArtifact('config-project-artifact');
+
+            expect(res.statusCode).to.equal(500);
+            expect(res.body.error.details).to.contain(
+                'CONFIG_GENERATOR_REMOTE_FAILURE',
+            );
+            expect(res.body.error.details).to.contain(
+                'Remote generation failed',
+            );
+            expect(res.body.error.details).to.contain(
+                'https://example.com/config',
+            );
+            expect(res.body.error.details).to.contain('[REDACTED]');
+            expect(res.body.error.details).to.not.contain('super-secret-token');
+            expect(res.body.error.details).to.not.contain('age1sensitive');
+        } finally {
+            extensionRegistry.getArtifactSourceAdapter =
+                originalGetArtifactSourceAdapter;
         }
     });
 });
