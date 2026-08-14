@@ -217,4 +217,28 @@ describe('Resource contracts', function () {
                     !JSON.stringify(error.details).includes(privateBody),
             );
     });
+
+    it('rejects an output envelope for a different resource without leaking its body', function () {
+        const privateBody = 'PRIVATE RULE CONTENT';
+
+        expect(() =>
+            normalizeResourceOutput(
+                {
+                    ref: resourceRef({ id: 'other-resource' }),
+                    representation: 'surge-rule-set',
+                    body: privateBody,
+                },
+                {
+                    ref: resourceRef(),
+                    representation: 'surge-rule-set',
+                },
+            ),
+        )
+            .to.throw()
+            .that.satisfies(
+                (error) =>
+                    error.code === 'RESOURCE_OUTPUT_INVALID' &&
+                    !JSON.stringify(error.details).includes(privateBody),
+            );
+    });
 });

@@ -3,8 +3,7 @@ import { routeExecutionLane } from './contracts';
 import { getExtensionManager } from './manager';
 import { failed } from '@/restful/response';
 import {
-    RESOURCE_REF_SCHEMA,
-    normalizeResourceDescriptor,
+    normalizeProviderResourceDescriptor,
     normalizeResourceRef,
     resourceError,
 } from './resource-contracts';
@@ -291,29 +290,16 @@ function strictSourceItems(extension, source) {
             );
         }
         return items.map((item) => {
-            const value =
-                typeof item === 'string' ? { id: item, name: item } : item;
-            const id = value?.id || value?.name;
-            return normalizeResourceDescriptor({
-                ref: {
-                    schema: RESOURCE_REF_SCHEMA,
+            return normalizeProviderResourceDescriptor(
+                {
                     providerId: extension.extensionId,
                     providerContributionId: source.id,
                     type: source.type,
-                    id,
                     contract: source.contract,
+                    representations: source.representations,
                 },
-                name: value?.name || id,
-                displayName: value?.displayName,
-                description: value?.description,
-                revision: value?.revision,
-                updatedAt: value?.updatedAt,
-                contracts: [source.contract],
-                representations: [...source.representations],
-                lifecycle: value?.lifecycle,
-                availability: { status: 'available' },
-                metadata: value?.metadata,
-            });
+                item,
+            );
         });
     });
 }

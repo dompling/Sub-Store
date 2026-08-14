@@ -128,7 +128,10 @@ export function createExtensionReferenceIndex({ store }) {
                 if (resourceRefKey(edge.target) !== targetKey) return;
                 incoming.set(resourceRefKey(edge.owner), edge);
             });
-            return [...incoming.values()];
+            return {
+                available: true,
+                items: [...incoming.values()],
+            };
         },
     });
 }

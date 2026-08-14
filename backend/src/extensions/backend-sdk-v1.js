@@ -3,6 +3,10 @@ import { ARTIFACTS_KEY } from '@/constants';
 import { ProxyUtils } from '@/core/proxy-utils';
 import resourceCache from '@/utils/resource-cache';
 import { runBackendRequestTask } from '@/utils/request-concurrency';
+import {
+    getUserAgentFromHeaders,
+    resolvePlatformFromUserAgent,
+} from '@/utils/user-agent';
 
 const SDK_API_VERSION = '1.0.0';
 
@@ -77,6 +81,19 @@ function freezeService(value) {
         if (entry && typeof entry === 'object') Object.freeze(entry);
     });
     return Object.freeze(value);
+}
+
+function resolveClientTarget(req = {}) {
+    const query = req.query || {};
+    if (query.platform) {
+        return { value: query.platform, source: 'platform-query' };
+    }
+    if (query.target) {
+        return { value: query.target, source: 'target-query' };
+    }
+    return resolvePlatformFromUserAgent(
+        getUserAgentFromHeaders(req.headers || {}),
+    );
 }
 
 /**
@@ -246,12 +263,29 @@ export function createBackendExtensionSdkV1({
                 throw error;
             }
             if (!referenceIndex) {
-                const error = new Error('Host reference index is unavailable');
-                error.code = 'REFERENCE_INDEX_UNAVAILABLE';
-                error.statusCode = 409;
-                throw error;
+                return {
+                    available: false,
+                    items: [],
+                    reasonCode: 'REFERENCE_INDEX_UNAVAILABLE',
+                };
             }
-            return referenceIndex.listIncoming(ref);
+            try {
+                return referenceIndex.listIncoming(ref);
+            } catch (error) {
+                if (
+                    ![
+                        'REFERENCE_INDEX_CORRUPT',
+                        'REFERENCE_INDEX_SCHEMA_UNSUPPORTED',
+                    ].includes(error?.code)
+                ) {
+                    throw error;
+                }
+                return {
+                    available: false,
+                    items: [],
+                    reasonCode: error.code,
+                };
+            }
         },
     };
     const network = {
@@ -282,6 +316,9 @@ export function createBackendExtensionSdkV1({
             );
         },
     };
+    const request = {
+        resolveClientTarget,
+    };
     return freezeService({
         apiVersion: SDK_API_VERSION,
         extensionId,
@@ -292,6 +329,7 @@ export function createBackendExtensionSdkV1({
         transform,
         cache,
         tasks,
+        request,
     });
 }
 

@@ -14,6 +14,8 @@ let originalRead;
 let originalWrite;
 let extensionRegistry;
 let originalGetArtifactSourceAdapter;
+let resourceBrokerModule;
+let originalGetDefaultResourceBroker;
 let state;
 let ageUtils;
 
@@ -115,6 +117,9 @@ describe('sync routes', function () {
         extensionRegistry = require('@/extensions/registry');
         originalGetArtifactSourceAdapter =
             extensionRegistry.getArtifactSourceAdapter;
+        resourceBrokerModule = require('@/extensions/resource-broker');
+        originalGetDefaultResourceBroker =
+            resourceBrokerModule.getDefaultResourceBroker;
         ageUtils = require('@/utils/age');
 
         originalRead = $.read.bind($);
@@ -131,6 +136,137 @@ describe('sync routes', function () {
             $.error = originalError;
         }
         if (extensionRegistry) {
+            extensionRegistry.getArtifactSourceAdapter =
+                originalGetArtifactSourceAdapter;
+        }
+        if (resourceBrokerModule) {
+            resourceBrokerModule.getDefaultResourceBroker =
+                originalGetDefaultResourceBroker;
+        }
+    });
+
+    it('uses sourceRef and representation without consulting the legacy type adapter', async function () {
+        const sourceRef = {
+            schema: 'substore.resource-ref@1',
+            providerId: 'org.example.rules',
+            providerContributionId: 'org.example.rules.rule-sets',
+            type: 'rule-set',
+            id: 'advertising',
+            contract: 'substore.rule-set@1',
+        };
+        let brokerInput;
+        let legacyLookupCount = 0;
+        extensionRegistry.getArtifactSourceAdapter = () => {
+            legacyLookupCount += 1;
+            return null;
+        };
+        resourceBrokerModule.getDefaultResourceBroker = () => ({
+            produce(ref, options) {
+                brokerInput = { ref, options };
+                return {
+                    body: 'DOMAIN,example.com',
+                    diagnostics: [],
+                    freshness: { state: 'fresh' },
+                };
+            },
+        });
+
+        try {
+            const output = await produceSyncArtifactOutput({
+                name: 'resource-artifact',
+                type: 'rule-set',
+                source: 'display-only',
+                sourceRef,
+                representation: 'surge-rule-set',
+                platform: 'Surge',
+                upload: false,
+            });
+
+            expect(output).to.equal('DOMAIN,example.com');
+            expect(legacyLookupCount).to.equal(0);
+            expect(brokerInput).to.deep.equal({
+                ref: sourceRef,
+                options: {
+                    representation: 'surge-rule-set',
+                    target: 'Surge',
+                    freshnessPolicy: undefined,
+                },
+            });
+        } finally {
+            extensionRegistry.getArtifactSourceAdapter =
+                originalGetArtifactSourceAdapter;
+            resourceBrokerModule.getDefaultResourceBroker =
+                originalGetDefaultResourceBroker;
+        }
+    });
+
+    it('fails closed when sourceRef is present but the Broker is unavailable', async function () {
+        let legacyLookupCount = 0;
+        extensionRegistry.getArtifactSourceAdapter = () => {
+            legacyLookupCount += 1;
+            return {
+                produce: () => 'legacy-fallback-must-not-run',
+            };
+        };
+        resourceBrokerModule.getDefaultResourceBroker = () => null;
+
+        let error;
+        try {
+            await produceSyncArtifactOutput({
+                name: 'resource-artifact',
+                type: 'rule-set',
+                source: 'display-only',
+                sourceRef: {
+                    schema: 'substore.resource-ref@1',
+                    providerId: 'org.example.rules',
+                    providerContributionId: 'org.example.rules.rule-sets',
+                    type: 'rule-set',
+                    id: 'advertising',
+                    contract: 'substore.rule-set@1',
+                },
+                representation: 'surge-rule-set',
+                platform: 'Surge',
+            });
+        } catch (cause) {
+            error = cause;
+        } finally {
+            extensionRegistry.getArtifactSourceAdapter =
+                originalGetArtifactSourceAdapter;
+            resourceBrokerModule.getDefaultResourceBroker =
+                originalGetDefaultResourceBroker;
+        }
+
+        expect(error.code).to.equal('RESOURCE_BROKER_UNAVAILABLE');
+        expect(legacyLookupCount).to.equal(0);
+    });
+
+    it('unwraps a ResourceOutput envelope on the legacy artifact path', async function () {
+        const adapter = {
+            type: 'config-project',
+            platforms: ['Surge'],
+            produce: () => ({
+                representation: 'surge-config',
+                body: '[General]\nloglevel = notify',
+                freshness: { state: 'fresh' },
+                diagnostics: [],
+            }),
+        };
+        extensionRegistry.getArtifactSourceAdapter = (type) =>
+            type === adapter.type
+                ? adapter
+                : originalGetArtifactSourceAdapter(type);
+
+        try {
+            const output = await produceSyncArtifactOutput({
+                name: 'config-project-artifact',
+                type: 'config-project',
+                source: 'demo-project',
+                platform: 'Surge',
+                upload: false,
+            });
+
+            expect(output).to.equal('[General]\nloglevel = notify');
+        } finally {
             extensionRegistry.getArtifactSourceAdapter =
                 originalGetArtifactSourceAdapter;
         }

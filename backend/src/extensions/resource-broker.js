@@ -1,7 +1,6 @@
 import { COLLECTIONS_KEY, SUBS_KEY } from '@/constants';
 import {
-    RESOURCE_REF_SCHEMA,
-    normalizeResourceDescriptor,
+    normalizeProviderResourceDescriptor,
     normalizeResourceOutput,
     normalizeResourceRef,
     resourceError,
@@ -88,17 +87,6 @@ export function createCoreResourceProviders({ store }) {
     ];
 }
 
-function providerRef(provider, id) {
-    return {
-        schema: RESOURCE_REF_SCHEMA,
-        providerId: provider.providerId,
-        providerContributionId: provider.providerContributionId,
-        type: provider.source.type,
-        id,
-        contract: provider.source.contract,
-    };
-}
-
 function providerLifecycleError(manager, providerId) {
     const availability = manager?.getAvailability?.(providerId) || {
         status: 'missing',
@@ -130,32 +118,16 @@ function providerLifecycleError(manager, providerId) {
 }
 
 function descriptorFrom(provider, item) {
-    const value =
-        typeof item === 'string' ? { id: item, name: item } : item || {};
-    const id = value.id || value.name;
-    if (typeof id !== 'string' || !id.trim()) {
-        throw resourceError(
-            'RESOURCE_DESCRIPTOR_INVALID',
-            'Resource provider returned an item without an id',
-            {
-                providerId: provider.providerId,
-                providerContributionId: provider.providerContributionId,
-            },
-        );
-    }
-    return normalizeResourceDescriptor({
-        ref: providerRef(provider, id),
-        name: value.name || id,
-        displayName: value.displayName,
-        description: value.description,
-        revision: value.revision,
-        updatedAt: value.updatedAt,
-        contracts: [provider.source.contract],
-        representations: [...provider.source.representations],
-        lifecycle: value.lifecycle,
-        availability: { status: 'available' },
-        metadata: value.metadata,
-    });
+    return normalizeProviderResourceDescriptor(
+        {
+            providerId: provider.providerId,
+            providerContributionId: provider.providerContributionId,
+            type: provider.source.type,
+            contract: provider.source.contract,
+            representations: provider.source.representations,
+        },
+        item,
+    );
 }
 
 function assertProviderContract(provider, ref) {
@@ -262,7 +234,17 @@ export function createResourceBroker({
                 404,
             );
         }
-        return descriptorFrom(provider, item);
+        return normalizeProviderResourceDescriptor(
+            {
+                providerId: provider.providerId,
+                providerContributionId: provider.providerContributionId,
+                type: provider.source.type,
+                contract: provider.source.contract,
+                representations: provider.source.representations,
+            },
+            item,
+            { expectedRef: ref },
+        );
     };
 
     return Object.freeze({

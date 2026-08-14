@@ -89,10 +89,14 @@ describe('Extension resource reference index', function () {
         index.replaceOwn({ owner, targets: [removedTarget] });
         index.replaceOwn({ owner, targets: [retainedTarget] });
 
-        expect(index.listIncoming(removedTarget)).to.deep.equal([]);
-        expect(index.listIncoming(retainedTarget)).to.deep.equal([
-            { owner, target: retainedTarget },
-        ]);
+        expect(index.listIncoming(removedTarget)).to.deep.equal({
+            available: true,
+            items: [],
+        });
+        expect(index.listIncoming(retainedTarget)).to.deep.equal({
+            available: true,
+            items: [{ owner, target: retainedTarget }],
+        });
     });
 
     it('preserves edges owned by other resources during replacement', function () {
@@ -106,9 +110,10 @@ describe('Extension resource reference index', function () {
         index.replaceOwn({ owner: secondOwner, targets: [target] });
         index.replaceOwn({ owner: firstOwner, targets: [] });
 
-        expect(index.listIncoming(target)).to.deep.equal([
-            { owner: secondOwner, target },
-        ]);
+        expect(index.listIncoming(target)).to.deep.equal({
+            available: true,
+            items: [{ owner: secondOwner, target }],
+        });
     });
 
     it('deduplicates repeated targets for one owner', function () {
@@ -119,7 +124,10 @@ describe('Extension resource reference index', function () {
 
         index.replaceOwn({ owner, targets: [target, { ...target }, target] });
 
-        expect(index.listIncoming(target)).to.deep.equal([{ owner, target }]);
+        expect(index.listIncoming(target)).to.deep.equal({
+            available: true,
+            items: [{ owner, target }],
+        });
         expect(persistedIndex(store).edges).to.have.length(1);
     });
 
@@ -131,7 +139,10 @@ describe('Extension resource reference index', function () {
 
         index.replaceOwn({ owner, targets: [target] });
 
-        expect(index.listIncoming(target)).to.deep.equal([{ owner, target }]);
+        expect(index.listIncoming(target)).to.deep.equal({
+            available: true,
+            items: [{ owner, target }],
+        });
         for (const [field, value] of [
             ['providerId', 'org.example.other-provider'],
             ['providerContributionId', 'org.example.rule-studio.other-source'],
@@ -142,7 +153,7 @@ describe('Extension resource reference index', function () {
             expect(
                 index.listIncoming({ ...target, [field]: value }),
                 field,
-            ).to.deep.equal([]);
+            ).to.deep.equal({ available: true, items: [] });
         }
     });
 

@@ -80,6 +80,112 @@ export function resourceRefKey(input) {
     ].join('\u0000');
 }
 
+export function normalizeProviderResourceDescriptor(
+    provider,
+    input,
+    { expectedRef } = {},
+) {
+    if (!provider || typeof provider !== 'object') {
+        throw resourceError(
+            'RESOURCE_DESCRIPTOR_INVALID',
+            'Resource provider identity is missing',
+        );
+    }
+    const value =
+        typeof input === 'string' ? { id: input, name: input } : input;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw resourceError(
+            'RESOURCE_DESCRIPTOR_INVALID',
+            'Resource provider returned an invalid descriptor',
+        );
+    }
+    const declaredRepresentations = Array.isArray(provider.representations)
+        ? provider.representations
+        : [];
+    const fallbackId = value.id || value.name;
+    const ref = value.ref
+        ? normalizeResourceRef(value.ref)
+        : normalizeResourceRef({
+              schema: RESOURCE_REF_SCHEMA,
+              providerId: provider.providerId,
+              providerContributionId: provider.providerContributionId,
+              type: provider.type,
+              id: fallbackId,
+              contract: provider.contract,
+          });
+    const expectedProviderRef = {
+        providerId: provider.providerId,
+        providerContributionId: provider.providerContributionId,
+        type: provider.type,
+        contract: provider.contract,
+    };
+    for (const [field, expected] of Object.entries(expectedProviderRef)) {
+        if (ref[field] === expected) continue;
+        throw resourceError(
+            'RESOURCE_DESCRIPTOR_INVALID',
+            `Resource descriptor ${field} does not match its provider`,
+            { field, expected, actual: ref[field] },
+        );
+    }
+    if (expectedRef && resourceRefKey(ref) !== resourceRefKey(expectedRef)) {
+        throw resourceError(
+            'RESOURCE_DESCRIPTOR_INVALID',
+            'Resource provider returned a descriptor for another resource',
+            {
+                providerId: ref.providerId,
+                providerContributionId: ref.providerContributionId,
+                type: ref.type,
+                expectedId: normalizeResourceRef(expectedRef).id,
+                actualId: ref.id,
+            },
+        );
+    }
+    const representations = Array.isArray(value.representations)
+        ? value.representations
+        : declaredRepresentations;
+    if (
+        representations.length === 0 ||
+        representations.some(
+            (representation) =>
+                typeof representation !== 'string' ||
+                !declaredRepresentations.includes(representation),
+        )
+    ) {
+        throw resourceError(
+            'RESOURCE_DESCRIPTOR_INVALID',
+            'Resource descriptor declares unsupported representations',
+            {
+                providerId: ref.providerId,
+                providerContributionId: ref.providerContributionId,
+            },
+        );
+    }
+    if (
+        value.contracts != null &&
+        (!Array.isArray(value.contracts) ||
+            !value.contracts.includes(provider.contract))
+    ) {
+        throw resourceError(
+            'RESOURCE_DESCRIPTOR_INVALID',
+            'Resource descriptor does not declare its provider contract',
+            { contract: provider.contract },
+        );
+    }
+    return normalizeResourceDescriptor({
+        ref,
+        name: value.name || ref.id,
+        displayName: value.displayName,
+        description: value.description,
+        revision: value.revision,
+        updatedAt: value.updatedAt,
+        contracts: [provider.contract],
+        representations: [...representations],
+        lifecycle: value.lifecycle,
+        availability: value.availability || { status: 'available' },
+        metadata: value.metadata,
+    });
+}
+
 export function normalizeResourceDiagnostic(input) {
     if (!input || typeof input !== 'object' || Array.isArray(input)) {
         throw resourceError(
@@ -193,6 +299,24 @@ export function normalizeResourceOutput(
     { ref, representation, legacy = false } = {},
 ) {
     const normalizedRef = normalizeResourceRef(ref || input?.ref);
+    if (
+        input &&
+        typeof input === 'object' &&
+        !Array.isArray(input) &&
+        input.ref &&
+        resourceRefKey(input.ref) !== resourceRefKey(normalizedRef)
+    ) {
+        throw resourceError(
+            'RESOURCE_OUTPUT_INVALID',
+            'Resource output reference does not match the request',
+            {
+                providerId: normalizedRef.providerId,
+                providerContributionId: normalizedRef.providerContributionId,
+                type: normalizedRef.type,
+                id: normalizedRef.id,
+            },
+        );
+    }
     if (typeof representation !== 'string' || !representation.trim()) {
         throw resourceError(
             'RESOURCE_REPRESENTATION_UNSUPPORTED',

@@ -15,41 +15,45 @@ export function getUserAgentFromHeaders(headers) {
     return { UA, ua, accept };
 }
 
-export function getPlatformFromUserAgent({ ua, UA, accept }) {
+export function resolvePlatformFromUserAgent({ ua, UA, accept }) {
     if (UA.indexOf('Quantumult%20X') !== -1) {
-        return 'QX';
+        return { value: 'QX', source: 'user-agent' };
     } else if (ua.indexOf('egern') !== -1) {
-        return 'Egern';
+        return { value: 'Egern', source: 'user-agent' };
     } else if (UA.indexOf('Surfboard') !== -1) {
-        return 'Surfboard';
+        return { value: 'Surfboard', source: 'user-agent' };
     } else if (UA.indexOf('Surge Mac') !== -1) {
-        return 'SurgeMac';
+        return { value: 'SurgeMac', source: 'user-agent' };
     } else if (UA.indexOf('Surge') !== -1) {
-        return 'Surge';
+        return { value: 'Surge', source: 'user-agent' };
     } else if (UA.indexOf('Decar') !== -1 || UA.indexOf('Loon') !== -1) {
-        return 'Loon';
+        return { value: 'Loon', source: 'user-agent' };
     } else if (UA.indexOf('Shadowrocket') !== -1) {
-        return 'Shadowrocket';
+        return { value: 'Shadowrocket', source: 'user-agent' };
     } else if (UA.indexOf('Stash') !== -1) {
-        return 'Stash';
+        return { value: 'Stash', source: 'user-agent' };
     } else if (
         ua === 'meta' ||
         (ua.indexOf('clash') !== -1 && ua.indexOf('meta') !== -1) ||
         ua.indexOf('clash-verge') !== -1 ||
         ua.indexOf('flclash') !== -1
     ) {
-        return 'ClashMeta';
+        return { value: 'ClashMeta', source: 'user-agent' };
     } else if (ua.indexOf('clash') !== -1) {
-        return 'Clash';
+        return { value: 'Clash', source: 'user-agent' };
     } else if (ua.indexOf('v2ray') !== -1) {
-        return 'V2Ray';
+        return { value: 'V2Ray', source: 'user-agent' };
     } else if (ua.indexOf('sing-box') !== -1 || ua.indexOf('singbox') !== -1) {
-        return 'sing-box';
+        return { value: 'sing-box', source: 'user-agent' };
     } else if (accept.indexOf('application/json') === 0) {
-        return 'JSON';
+        return { value: 'JSON', source: 'accept' };
     } else {
-        return 'V2Ray';
+        return { value: 'V2Ray', source: 'default' };
     }
+}
+
+export function getPlatformFromUserAgent(input) {
+    return resolvePlatformFromUserAgent(input).value;
 }
 
 export function getPlatformFromHeaders(headers) {
