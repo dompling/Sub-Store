@@ -6,9 +6,7 @@ services:
     image: "${SUB_STORE_IMAGE:-sub-store-backend:local}"
     init: true
     restart: unless-stopped
-    env_file:
-      - path: .env
-        required: false
+    env_file: .env
     ports:
       - "${SUB_STORE_BACKEND_BIND_ADDRESS:-127.0.0.1}:${SUB_STORE_BACKEND_PORT:-3000}:3000"
     environment:
