@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile
     image: "${SUB_STORE_IMAGE:-sub-store-backend:local}"
     init: true
-    restartπ: unless-stopped
+    restart: unless-stopped
     env_file:
       - path: .env
         required: false
