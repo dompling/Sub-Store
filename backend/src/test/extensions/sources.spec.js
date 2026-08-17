@@ -25,6 +25,7 @@ import {
 import { createNodeExtensionPackageStore } from '@/extensions/package-store';
 import { clearExtensionRegistryForTests } from '@/extensions/registry';
 import { registerExtensionControlRoutes } from '@/restful/extensions';
+import { SETTINGS_KEY } from '@/constants';
 import dns from 'dns';
 import fs from 'fs';
 import os from 'os';
@@ -711,6 +712,89 @@ describe('Community extension sources', function () {
             'cache-control': 'no-cache',
             pragma: 'no-cache',
         });
+    });
+
+    it('reuses the stored GitHub Gist token for GitHub extension sources', async function () {
+        const fixture = contentFixture();
+        const sourceUrl =
+            'https://raw.githubusercontent.com/example/repo/main/catalog.json';
+        const githubStore = createStore(undefined);
+        const githubRead = githubStore.read;
+        githubStore.read = (key) =>
+            key === SETTINGS_KEY
+                ? { gistToken: 'gist-test-token', syncPlatform: 'github' }
+                : githubRead(key);
+        let githubRequestOptions;
+        const githubManager = new ExtensionManager({
+            store: githubStore,
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async (_url, options) => {
+                githubRequestOptions = options;
+                return response(fixture.catalog);
+            },
+        });
+
+        await githubManager.addSource({ url: sourceUrl });
+        expect(githubRequestOptions.headers).to.include({
+            Authorization: 'Bearer gist-test-token',
+        });
+
+        const gitlabStore = createStore(undefined);
+        const gitlabRead = gitlabStore.read;
+        gitlabStore.read = (key) =>
+            key === SETTINGS_KEY
+                ? { gistToken: 'gitlab-test-token', syncPlatform: 'gitlab' }
+                : gitlabRead(key);
+        let gitlabRequestOptions;
+        const gitlabManager = new ExtensionManager({
+            store: gitlabStore,
+            env: { isNode: true },
+            packageStore: null,
+            sourceFetcher: async (_url, options) => {
+                gitlabRequestOptions = options;
+                return response(fixture.catalog);
+            },
+        });
+
+        await gitlabManager.addSource({ url: sourceUrl });
+        expect(gitlabRequestOptions.headers).to.not.have.property(
+            'Authorization',
+        );
+    });
+
+    it('does not forward the Gist token after a GitHub source leaves GitHub', async function () {
+        const calls = [];
+        await fetchExtensionSourceDocument(
+            'https://raw.githubusercontent.com/example/repo/main/catalog.json',
+            {
+                githubToken: 'gist-test-token',
+                fetcher: async (url, options) => {
+                    calls.push({ url, options });
+                    if (calls.length === 1) {
+                        return {
+                            ok: false,
+                            status: 302,
+                            headers: {
+                                get(name) {
+                                    return name === 'location'
+                                        ? 'https://example.test/catalog.json'
+                                        : null;
+                                },
+                            },
+                        };
+                    }
+                    return response({ schemaVersion: 1, entries: [] });
+                },
+            },
+        );
+
+        expect(calls[0].options.headers).to.include({
+            Authorization: 'Bearer gist-test-token',
+        });
+        expect(calls[1].options.headers).to.not.have.property(
+            'Authorization',
+        );
     });
 
     it('allows HTTPS sources through proxy fake-IP DNS without admitting private targets', async function () {

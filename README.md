@@ -204,6 +204,13 @@ background production, remote data restore, and optional backend path-prefix
 mode. See `.env.example` for the local template and the official image page for
 their full semantics.
 
+When the Node Host refreshes a GitHub-hosted extension catalog or downloads a
+package from GitHub, it reuses the existing `settings.gistToken` credential
+when the selected sync platform is GitHub. No second GitHub token is required
+in `.env`; a GitLab `gistToken` is deliberately not sent to GitHub. The token
+is attached only to GitHub-owned hosts and is removed across redirects to
+other hosts.
+
 An equivalent direct Docker launch is:
 
 ```bash
@@ -238,11 +245,13 @@ ghcr.io/dompling/sub-store
 
 The workflow runs the backend test suite, then builds without pushing on pull
 requests. Backend changes pushed to `master` publish rolling `master`, SHA, and
-`latest` tags. After the repository's existing `build` release workflow
-succeeds (including its test suite), the same commit is also published with the
-version from `backend/package.json` and its major/minor tag. Manually pushed
-version tags (`X.Y.Z` or `vX.Y.Z`) are supported too and must match
-`backend/package.json`. The release hook also verifies that the generated
+`latest` tags; ordinary backend changes do not require updating
+`backend/package.json`. That version remains owned by the main-branch release
+flow. When the version changes on `master` and the repository's existing
+`build` workflow succeeds (including its test suite), the same commit is also
+published with the version from `backend/package.json` and its major/minor tag.
+Manually pushed version tags (`X.Y.Z` or `vX.Y.Z`) are supported too and must
+match `backend/package.json`. The release hook also verifies that the generated
 version tag points to the exact commit being packaged.
 This extra release-workflow hook is necessary because GitHub does not start a
 second workflow from a tag created by the repository `GITHUB_TOKEN`.

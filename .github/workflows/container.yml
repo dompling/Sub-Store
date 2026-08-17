@@ -25,9 +25,11 @@ on:
       - '[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+'
     paths:
+      # Rolling images rebuild for backend changes without requiring a
+      # backend/package.json version bump.
       - 'backend/**'
-      # Package-version-only branch pushes publish after the release job.
-      # GitHub does not apply path filters to tag pushes.
+      # Package-version-only branch pushes publish after the build release
+      # workflow. GitHub does not apply path filters to tag pushes.
       - '!backend/package.json'
       - '.node-version'
       - '.github/workflows/container.yml'

@@ -5,6 +5,7 @@ import {
     EXTENSION_STATE_INDEX_KEY,
     EXTENSIONS_KEY,
     LEGACY_EXTENSIONS_KEY,
+    SETTINGS_KEY,
 } from '@/constants';
 import {
     EXTENSION_HOST_API_VERSION,
@@ -187,6 +188,23 @@ function managementMode(env = {}) {
     if (env.isNode && configuredToken) return 'token';
     if (env.isNode) return 'open';
     return 'read-only';
+}
+
+function githubTokenFromStore(store = $) {
+    try {
+        let settings = store?.read?.(SETTINGS_KEY) || {};
+        if (typeof settings === 'string') settings = JSON.parse(settings);
+        // `gistToken` is also used for GitLab when that platform is selected;
+        // never send a GitLab credential to a GitHub source.
+        if (`${settings.syncPlatform || ''}`.toLowerCase() === 'gitlab') {
+            return '';
+        }
+        return typeof settings.gistToken === 'string'
+            ? settings.gistToken.trim()
+            : '';
+    } catch (error) {
+        return '';
+    }
 }
 
 function digestOnlyEnabledFromEnvironment() {
@@ -1932,6 +1950,7 @@ export class ExtensionManager {
     async _loadCommunitySource(url, sourceId) {
         const fetched = await fetchExtensionSourceDocument(url, {
             fetcher: this.sourceFetcher,
+            githubToken: githubTokenFromStore(this.store),
         });
         const catalog = normalizeCommunityCatalog(
             fetched.document,
@@ -3385,6 +3404,7 @@ export class ExtensionManager {
             : (
                   await fetchExtensionSourceDocument(packageUrl, {
                       fetcher: this.sourceFetcher,
+                      githubToken: githubTokenFromStore(this.store),
                   })
               ).document;
         return this.install(canonicalId, {

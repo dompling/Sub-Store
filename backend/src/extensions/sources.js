@@ -21,6 +21,15 @@ export const MAX_EXTENSION_SOURCE_REDIRECTS = 3;
 export const MAX_EXTENSION_SOURCE_URL_LENGTH = 2048;
 export const SOURCE_EXECUTABLE_DISTRIBUTION = 'source-executable';
 
+const GITHUB_TOKEN_HOSTS = new Set([
+    'api.github.com',
+    'codeload.github.com',
+    'github.com',
+    'objects.githubusercontent.com',
+    'raw.githubusercontent.com',
+    'www.github.com',
+]);
+
 function nodeModule(name) {
     try {
         if (eval('typeof process === "undefined"')) return null;
@@ -28,6 +37,19 @@ function nodeModule(name) {
     } catch (error) {
         return null;
     }
+}
+
+function githubAuthorizationHeader(url, token) {
+    if (!token) return {};
+    let hostname;
+    try {
+        hostname = new URL(url).hostname.toLowerCase();
+    } catch (error) {
+        return {};
+    }
+    return GITHUB_TOKEN_HOSTS.has(hostname)
+        ? { Authorization: `Bearer ${token}` }
+        : {};
 }
 
 function sourceError(code, message, details = {}, statusCode = 409) {
@@ -377,9 +399,11 @@ function parseResponseHeaders(response) {
 /** Fetch a JSON source document with bounded redirects and response size. */
 export async function fetchExtensionSourceDocument(
     rawUrl,
-    { fetcher, timeoutMs = 10000 } = {},
+    { fetcher, timeoutMs = 10000, githubToken } = {},
 ) {
     let currentUrl = normalizeExtensionSourceUrl(rawUrl);
+    const configuredToken =
+        typeof githubToken === 'string' ? githubToken.trim() : '';
     // Loopback is a narrow, explicit development exception. A remote source
     // must not acquire that privilege through redirects.
     const allowLoopback = isLoopbackHost(new URL(currentUrl).hostname);
@@ -416,6 +440,7 @@ export async function fetchExtensionSourceDocument(
                     'cache-control': 'no-cache',
                     pragma: 'no-cache',
                     'user-agent': 'Sub-Store-Extension-Host/1',
+                    ...githubAuthorizationHeader(currentUrl, configuredToken),
                 },
                 signal: controller?.signal,
             });
