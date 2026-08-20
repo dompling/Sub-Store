@@ -244,9 +244,11 @@ ghcr.io/dompling/sub-store
 ```
 
 The workflow runs the backend test suite, then builds without pushing on pull
-requests. Backend changes pushed to `master` publish rolling `master`, SHA, and
-`latest` tags; ordinary backend changes do not require updating
-`backend/package.json`. That version remains owned by the main-branch release
+requests. Backend changes pushed to `master` or `config-generator` publish
+their branch and SHA tags. The repository's default branch additionally
+publishes `latest`; the current default and active deployment branch is
+`config-generator`. Ordinary backend changes do not require updating
+`backend/package.json`. That version remains owned by the `master` release
 flow. When the version changes on `master` and the repository's existing
 `build` workflow succeeds (including its test suite), the same commit is also
 published with the version from `backend/package.json` and its major/minor tag.
