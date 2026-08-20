@@ -19,7 +19,10 @@ import registerSubscriptionRoutes from '@/restful/subscriptions';
 import registerArtifactRoutes from '@/restful/artifacts';
 import registerSettingRoutes from '@/restful/settings';
 import registerMiscRoutes from '@/restful/miscs';
-import registerSortRoutes from '@/restful/sort';
+import {
+    registerArtifactSortRoute,
+    registerCoreSortRoutes,
+} from '@/restful/sort';
 import registerFileRoutes from '@/restful/file';
 import registerTokenRoutes from '@/restful/token';
 import registerArchiveRoutes from '@/restful/archives';
@@ -59,8 +62,9 @@ function serve() {
     registerArtifactRoutes(configHostingApps.legacy);
     registerArtifactRoutes(configHostingApps.canonical);
     registerSettingRoutes($app);
-    registerSortRoutes(configHostingApps.legacy);
-    registerSortRoutes(configHostingApps.canonical);
+    registerCoreSortRoutes($app);
+    registerArtifactSortRoute(configHostingApps.legacy);
+    registerArtifactSortRoute(configHostingApps.canonical);
     registerArchiveRoutes($app);
     registerMiscRoutes($app);
     registerLogRoutes($app);

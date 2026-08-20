@@ -9,13 +9,21 @@ import $ from '@/core/app';
 import { success } from '@/restful/response';
 import { sortArchiveEntries } from '@/utils/archive';
 
-export default function register($app) {
+export function registerCoreSortRoutes($app) {
     $app.post('/api/sort/subs', sortSubs);
     $app.post('/api/sort/collections', sortCollections);
-    $app.post('/api/sort/artifacts', sortArtifacts);
     $app.post('/api/sort/files', sortFiles);
     $app.post('/api/sort/tokens', sortTokens);
     $app.post('/api/sort/archives', sortArchive);
+}
+
+export function registerArtifactSortRoute($app) {
+    $app.post('/api/sort/artifacts', sortArtifacts);
+}
+
+export default function register($app) {
+    registerCoreSortRoutes($app);
+    registerArtifactSortRoute($app);
 }
 
 function sortSubs(req, res) {
