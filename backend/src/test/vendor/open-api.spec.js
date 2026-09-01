@@ -1,4 +1,6 @@
 import { expect } from 'chai';
+import http from 'http';
+import zlib from 'zlib';
 import { afterEach, beforeEach, describe, it } from 'mocha';
 
 import { HTTP } from '@/vendor/open-api';
@@ -117,10 +119,18 @@ describe('open-api HTTP adapter', function () {
         });
 
         expect(agentOptions).to.have.length(2);
-        expect(agentOptions.map(({ proxyTunnel }) => proxyTunnel)).to.deep.equal([
-            true,
-            true,
-        ]);
+        expect(
+            agentOptions.map(({ proxyTunnel }) => proxyTunnel),
+        ).to.deep.equal([true, true]);
+    });
+
+    it('normalizes numeric string timeouts for undici', async function () {
+        await HTTP({ timeout: '5000' }).get('https://example.com/subscription');
+
+        expect(agentOptions[0]).to.include({
+            bodyTimeout: 5000,
+            headersTimeout: 5000,
+        });
     });
 
     it('uses the Undici option that throws at the redirect limit', async function () {
@@ -130,6 +140,35 @@ describe('open-api HTTP adapter', function () {
             maxRedirections: 3,
             throwOnMaxRedirect: true,
         });
+    });
+
+    it('decompresses Node.js responses before reading their body', async function () {
+        undici.EnvHttpProxyAgent = originalEnvHttpProxyAgent;
+        undici.ProxyAgent = originalProxyAgent;
+        undici.interceptors.redirect = originalRedirect;
+        undici.request = originalRequest;
+
+        const payload = JSON.stringify({
+            html_url: 'https://example.test/gist',
+        });
+        const server = http.createServer((_request, response) => {
+            response.setHeader('Content-Encoding', 'br');
+            response.end(zlib.brotliCompressSync(payload));
+        });
+
+        await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+        try {
+            const response = await HTTP().get({
+                url: `http://127.0.0.1:${server.address().port}`,
+                headers: { 'Accept-Encoding': 'gzip, deflate, br' },
+            });
+
+            expect(JSON.parse(response.body)).to.deep.equal({
+                html_url: 'https://example.test/gist',
+            });
+        } finally {
+            await new Promise((resolve) => server.close(resolve));
+        }
     });
 
     it('rejects request setup errors', async function () {

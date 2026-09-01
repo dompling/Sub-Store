@@ -58,7 +58,7 @@ import { EXTENSION_IDS } from '@/extensions/contracts';
         if (col_names.length > 0)
             await produceArtifacts(col_names, 'collection');
     } else {
-        const settings = $.read(SETTINGS_KEY);
+        const settings = $.read(SETTINGS_KEY) || {};
         const artifacts = $.read(ARTIFACTS_KEY);
         if (!artifacts || artifacts.length === 0) return;
 

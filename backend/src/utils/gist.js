@@ -57,7 +57,7 @@ export default class Gist {
     constructor({ token, key, syncPlatform }) {
         const { isStash, isLoon, isShadowRocket, isQX } = ENV();
         const { defaultProxy, githubApiTimeout, githubProxy, githubApiUrl } =
-            $.read(SETTINGS_KEY);
+            $.read(SETTINGS_KEY) || {};
         const githubApiRequestTimeout = githubApiTimeout || 10000;
         const githubGistBaseURL = getGithubGistBaseURL({
             githubApiUrl,
@@ -151,6 +151,24 @@ export default class Gist {
 
         this.key = key;
         this.syncPlatform = syncPlatform;
+
+        // 串行请求队列锁 防止响应串扰
+        this._requestQueue = Promise.resolve();
+        const queuedMethods = ['get', 'post', 'put', 'patch', 'delete'];
+        for (const method of queuedMethods) {
+            const original = this.http[method];
+            if (typeof original === 'function') {
+                this.http[method] = (...args) => {
+                    return new Promise((resolve, reject) => {
+                        this._requestQueue = this._requestQueue.then(() =>
+                            original
+                                .apply(this.http, args)
+                                .then(resolve, reject),
+                        );
+                    });
+                };
+            }
+        }
     }
 
     async locate() {
@@ -193,13 +211,13 @@ export default class Gist {
         const hasEmptyFileFallback = Boolean(emptyFileFallback?.filename);
         const uploadMeta = {};
 
-        const attachUploadMeta = (request) =>
-            request.then((response) => {
-                if (Object.keys(uploadMeta).length > 0) {
-                    response.subStoreUploadMeta = uploadMeta;
-                }
-                return response;
-            });
+        const attachUploadMeta = async (request) => {
+            const response = await request;
+            if (Object.keys(uploadMeta).length > 0) {
+                response.subStoreUploadMeta = uploadMeta;
+            }
+            return response;
+        };
 
         const applyEmptyFileFallback = ({ actions, existingFiles, result }) => {
             if (!hasEmptyFileFallback) return;
@@ -338,6 +356,10 @@ export default class Gist {
                 return attachUploadMeta(
                     this.http.patch({
                         url: `/gists/${gist.id}`,
+                        headers: {
+                            ...this.headers,
+                            'Accept-Encoding': 'gzip, deflate, br',
+                        },
                         body: JSON.stringify({ files }),
                     }),
                 );

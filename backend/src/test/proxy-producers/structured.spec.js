@@ -365,7 +365,7 @@ describe('Proxy structured producers', function () {
         }
     });
 
-    it('keeps Mihomo Snell versions 1 through 5', function () {
+    it('keeps Mihomo and Stash Snell versions 1 through 5', function () {
         const proxies = [1, 2, 3, 4, 5, 6].map((version) => ({
             type: 'snell',
             name: `Snell ${version}`,
@@ -376,27 +376,41 @@ describe('Proxy structured producers', function () {
             udp: true,
         }));
 
-        const internal = produceInternal('Mihomo', proxies);
-        const external = loadProducedYaml('Mihomo', proxies);
+        for (const platform of ['Mihomo', 'Stash']) {
+            const internal = produceInternal(
+                platform,
+                proxies.map((proxy) => ({ ...proxy })),
+            );
+            const external = loadProducedYaml(
+                platform,
+                proxies.map((proxy) => ({ ...proxy })),
+            );
 
-        expect(internal.map((proxy) => proxy.version)).to.deep.equal([
-            1, 2, 3, 4, 5,
-        ]);
-        expect(external.proxies.map((proxy) => proxy.version)).to.deep.equal([
-            1, 2, 3, 4, 5,
-        ]);
-        expect(
-            internal.find((proxy) => proxy.version === 1),
-        ).to.not.have.property('udp');
-        expect(
-            internal.find((proxy) => proxy.version === 2),
-        ).to.not.have.property('udp');
-        expect(internal.find((proxy) => proxy.version === 4).udp).to.equal(
-            true,
-        );
-        expect(internal.find((proxy) => proxy.version === 5).udp).to.equal(
-            true,
-        );
+            expect(
+                internal.map((proxy) => proxy.version),
+                platform,
+            ).to.deep.equal([1, 2, 3, 4, 5]);
+            expect(
+                external.proxies.map((proxy) => proxy.version),
+                platform,
+            ).to.deep.equal([1, 2, 3, 4, 5]);
+            expect(
+                internal.find((proxy) => proxy.version === 1),
+                platform,
+            ).to.not.have.property('udp');
+            expect(
+                internal.find((proxy) => proxy.version === 2),
+                platform,
+            ).to.not.have.property('udp');
+            expect(internal.find((proxy) => proxy.version === 4).udp).to.equal(
+                true,
+                platform,
+            );
+            expect(internal.find((proxy) => proxy.version === 5).udp).to.equal(
+                true,
+                platform,
+            );
+        }
     });
 
     it('keeps supported Snell in sing-box by default', function () {
@@ -2462,7 +2476,7 @@ describe('Proxy structured producers', function () {
         });
     });
 
-    it('keeps Stash VLESS TCP REALITY nodes while still filtering non-tcp and unsupported variants', function () {
+    it('keeps Stash VLESS TCP REALITY and Encryption nodes while filtering non-tcp REALITY', function () {
         const proxies = [
             {
                 type: 'vless',
@@ -2545,15 +2559,17 @@ describe('Proxy structured producers', function () {
         const internal = produceInternal('Stash', proxies);
         const external = loadProducedYaml('Stash', proxies);
 
-        expect(internal).to.have.length(2);
-        expect(external.proxies).to.have.length(2);
+        expect(internal).to.have.length(3);
+        expect(external.proxies).to.have.length(3);
         expect(internal.map((proxy) => proxy.name)).to.deep.equal([
             'Supported Reality',
             'Custom Flow',
+            'Encrypted VLESS',
         ]);
         expect(external.proxies.map((proxy) => proxy.name)).to.deep.equal([
             'Supported Reality',
             'Custom Flow',
+            'Encrypted VLESS',
         ]);
         expectSubset(internal[0], {
             type: 'vless',
@@ -2564,6 +2580,11 @@ describe('Proxy structured producers', function () {
             name: 'Custom Flow',
             flow: 'xtls-rprx-unknown',
         });
+        expectSubset(internal[2], {
+            type: 'vless',
+            name: 'Encrypted VLESS',
+            encryption: 'aes-128-gcm',
+        });
         expectSubset(external.proxies[0], {
             type: 'vless',
             name: 'Supported Reality',
@@ -2572,6 +2593,11 @@ describe('Proxy structured producers', function () {
             type: 'vless',
             name: 'Custom Flow',
             flow: 'xtls-rprx-unknown',
+        });
+        expectSubset(external.proxies[2], {
+            type: 'vless',
+            name: 'Encrypted VLESS',
+            encryption: 'aes-128-gcm',
         });
     });
 
@@ -4488,6 +4514,70 @@ describe('Proxy structured producers', function () {
                 password: 'mask',
                 min_packet_size: 1024,
                 max_packet_size: 2048,
+            },
+        });
+    });
+
+    it('warns about the dropped certificate fingerprint for sing-box', function () {
+        const fingerprint =
+            'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+        const publicKeySha256 = '428F7quaQJvBhEr5TclcjPpsl1ryyNQo7oLBGhhC3UU=';
+        const { result, warnings } = captureWarns(() =>
+            produceInternal('sing-box', [
+                {
+                    type: 'trojan',
+                    name: 'Trojan Pinned',
+                    server: 'trojan.example.com',
+                    port: 443,
+                    password: 'secret',
+                    tls: true,
+                    'tls-fingerprint': fingerprint,
+                },
+                {
+                    type: 'hysteria2',
+                    name: 'Hysteria2 Public Key Pinned',
+                    server: 'hy2.example.com',
+                    port: 443,
+                    password: 'secret',
+                    'tls-fingerprint': fingerprint,
+                    _certificate_public_key_sha256: [publicKeySha256],
+                },
+                {
+                    type: 'vless',
+                    name: 'VLESS Reality Pinned',
+                    server: 'vless.example.com',
+                    port: 443,
+                    uuid: UUID,
+                    tls: true,
+                    'tls-fingerprint': fingerprint,
+                    'reality-opts': {
+                        'public-key': 'pubkey',
+                        'short-id': '08',
+                    },
+                },
+            ]),
+        );
+
+        expect(warnings).to.have.length(1);
+        expect(warnings[0]).to.include('Trojan Pinned');
+        expect(warnings[0]).to.include('_certificate_public_key_sha256');
+        expect(result[0].tls).to.not.have.property(
+            'certificate_public_key_sha256',
+        );
+        expectSubset(result[1], {
+            tls: {
+                enabled: true,
+                certificate_public_key_sha256: [publicKeySha256],
+            },
+        });
+        expectSubset(result[2], {
+            tls: {
+                enabled: true,
+                reality: {
+                    enabled: true,
+                    public_key: 'pubkey',
+                    short_id: '08',
+                },
             },
         });
     });
