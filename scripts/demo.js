@@ -11,7 +11,7 @@ function operator(proxies = [], targetPlatform, context) {
   // 4. 域名解析后会有`_IPv4`, `_IPv6`, `_IP`(若有多个步骤, 只取第一次成功的 v4 或 v6 数据), `_IP4P`(若解析类型为 IPv6 且符合 IP4P 类型, 将自动转换), `_domain` 字段, `_resolved_ips` 为解析出的所有 IP
   // 5. `_subName` 为单条订阅名, `_subDisplayName` 为单条订阅显示名
   // 6. `_collectionName` 为组合订阅名, `_collectionDisplayName` 为组合订阅显示名
-  // 7. `tls-fingerprint` 为 tls 指纹
+  // 7. `tls-fingerprint` 为服务器证书的 SHA-256 指纹, hex 格式, 支持大小写及冒号分隔
   // 8. `underlying-proxy` 为前置代理, 不同平台会自动转换
   //    例如 $server['underlying-proxy'] = '名称'
   //    只给 mihomo 输出的话, `dialer-proxy` 也行
@@ -34,7 +34,11 @@ function operator(proxies = [], targetPlatform, context) {
   //    注意: mihomo 风格的 `udp: true` 表示节点支持 UDP, 不会转换成 sing-box 的 `network: "udp"`; sing-box 默认就是 TCP+UDP. `udp: false` 会转换成 `network: "tcp"`. `_network` 是显式覆盖, 优先级高于 `udp`.
   // 17. `block-quic` 支持 `auto`, `on`, `off`. 不同的平台不一定都支持, 会自动转换
   // 18. `sing-box` 支持 `_fragment`, `_fragment_fallback_delay`, `_record_fragment` 设置 `tls` 的 `fragment`, `fragment_fallback_delay`, `record_fragment`
-  // 19. `sing-box` 支持 `_certificate`, `_certificate_path`, `_certificate_public_key_sha256`, `_client_certificate`, `_client_certificate_path`, `_client_key`, `_client_key_path` 设置 `tls` 的 `certificate`, `certificate_path`, `certificate_public_key_sha256`, `client_certificate`, `client_certificate_path`, `client_key`, `client_key_path`
+  // 19. `sing-box` 支持 `_certificate`, `_certificate_path`, `_certificate_sha256`, `_certificate_public_key_sha256`, `_client_certificate`, `_client_certificate_path`, `_client_key`, `_client_key_path` 设置 `tls` 的 `certificate`, `certificate_path`, `certificate_sha256`, `certificate_public_key_sha256`, `client_certificate`, `client_certificate_path`, `client_key`, `client_key_path`
+  //     sing-box 1.15.0 起支持 `certificate_sha256`: 自动将 `tls-fingerprint` 的 hex 解码后转成 Base64 数组; 手动设置 `_certificate_sha256` 时优先原样使用, 例如 $server._certificate_sha256 = ['47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=']
+  //     普通 TLS 和 ShadowTLS 使用相同的服务器证书配置逻辑; 已配置非空的 certificate、certificate_path 或 certificate_public_key_sha256 时不自动转换, certificate/certificate_public_key_sha256 的空数组不阻止转换; 手动设置 `_certificate_sha256: []` 仍优先使用; 自动转换遇到非法 SHA-256 hex 时会报错并过滤该节点
+  //     Reality 不使用证书/公钥 hash 校验, 不自动转换; 手动设置非空的 `_certificate_sha256` 或 `_certificate_public_key_sha256` 时会忽略并输出 warn 日志
+  //     非空 certificate/certificate_path 不能与非空 certificate_sha256/certificate_public_key_sha256 共存, 冲突时会报错并过滤该节点; certificate_sha256 与 certificate_public_key_sha256 可共存, 匹配任一即可
   // 20. `sing-box` 支持使用完整的 `_ech` 结构设置 `tls` 的 `ech`. 避免冲突, URI 里的原始 `ech` 参数会保存在 `_echConfigList`
   // 21. 2.21.59 开始, `sing-box` 支持使用 `ech-opts` 结构设置 `tls` 的 `ech`. 参考 https://github.com/sub-store-org/Sub-Store/pull/563/changes 基本沿用 mihomo 风格, mihomo 部分字段自动转换. URI `ech` 与 mihomo `ech-opts` 会互转: base64 ECHConfigList 使用 `ech-opts.config`; Xray 的 DNS server 写法(如 `https://1.1.1.1/dns-query` 或 `example.com+https://1.1.1.1/dns-query`)会把 DNS server 放到 `ech-opts._dns`, 显式查询域名放到 `ech-opts.query-server-name`. mihomo 不支持在 ech-opts 中配置 ECH DNS. 如需跟节点 ECH 配置一致, 请在 mihomo 配置文件里设置, 可参考: `dns["nameserver-policy"]["cloudflare-ech.com"] = ["https://dns.alidns.com/dns-query"]` . 反向输出 URI 时, 可设置 `ech-opts._dns` 来拼回 `ech`; 如果只设置 `query-server-name` 且未设置 `_dns`, 默认使用 `https://dns.alidns.com/dns-query` 并输出 warn 日志, 自定义 root DNS 请设置 `ech-opts._dns`. XHTTP `download-settings` 里嵌套的 TLS ECH 同样支持, 其中 `echForceQuery`/`echSockopt` 分别对应 `ech-opts._force-query`/`ech-opts._sockopt`, 嵌套 DNS 可设置 `xhttp-opts.download-settings.ech-opts._dns`
   // 22. `sing-box` 支持使用完整的 `_curve_preferences` 结构设置 `tls` 的 `curve_preferences`
@@ -52,7 +56,7 @@ function operator(proxies = [], targetPlatform, context) {
   // 28. sing-box 1.14.0 起才有 `control_http_client` , 暂时可使用 `control-http-client` 字段设置 sing-box 的 `control_http_client`
   //     若 `control-http-client` 非空, 输出 sing-box Tailscale endpoint 时会跳过旧版拨号字段映射, 避免和 `detour`/`dialer-proxy` 等 legacy dialer options 冲突. 需要给控制面设置前置代理时, 请写到 `control-http-client.detour`(1.14.0-alpha.26 又改回去了...)
   // 29. sing-box 支持使用 `ssh-server` 给 tailscale 设置 `ssh_server`, 直接设为 `true` 或 `{ "enabled": true, "disable-pty": true, "disable-sftp": true, "disable-forwarding": true }`
-  // 30. Loon 支持使用 `_loon_tls_profile` 设置 `tls-profile` 字段('default', 'chrome', 'ios18', 'ios26'), 否则则使用 client-fingerprint 自动转换部分对应的值
+  // 30. Loon 支持使用 `_loon_tls_profile` 设置 `tls-profile` 字段('global', 'default', 'safari-ios18', 'safari-ios-26', 'chrome', 'chrome147'), 优先使用该字段, 否则从 client-fingerprint 自动转换: reality-opts.support-x25519mlkem768 为 true 时, safari/ios -> safari-ios-26, 其他值(含空值) -> chrome147; 未开启时, chrome -> chrome, safari/ios -> safari-ios18. Loon 输入 chrome/chrome147 时, client-fingerprint 转成 chrome; 输入 safari-ios18/safari-ios-26 时转成 ios; `_loon_tls_profile` 保留原始值
   // 31. `shadow-tls-password`/`shadow-tls-sni`/`shadow-tls-version` 这套旧字段已废弃. 请使用 `plugin: 'shadow-tls'` 和 `plugin-opts: { password, host, version }`
   // 32. mihomo 中 Snell shadow-tls 字段与 ss shadow-tls 字段不同, 使用的是 obfs-opts 而不是 plugin+plugin-opts, 不能与 obfs http/tls 共存. Sub-Store 内部有字段转换, 建议直接使用单行 Surge 格式 `1=snell,a.com,443,version=4,psk="1",obfs=http,obfs-host=a.com,shadow-tls-password="1",shadow-tls-sni=a.com,shadow-tls-version=3,alpn="http/1.1,h2",reuse=true` . 若想使用 JSON/JSON5/YAML 单行格式输入, 可使用 `{ "name": "1", "server": "a.com", "port": 443, "psk": "1", "version": 4, "reuse": true, "type": "snell", "obfs-opts": { "mode": "http", "host": "a.com" }, "plugin": "shadow-tls", "plugin-opts": { "host": "a.com", "password": "1", "version": 3, "alpn": [ "http/1.1", "h2" ] } }`
   // 33. sing-box Snell 出站默认允许 version 4/5/6, 其中 version 5 会按 sing-box 行为输出成 version 4. 开启“含不支持的协议”时保留 version 1/2/3/4/5/6, 并支持 version 6 通过节点字段 `quic-proxy-mode` 设置 `quic_proxy_mode`. 节点上的 `_userkey` 会输出为 sing-box 的 `userkey`
@@ -60,6 +64,25 @@ function operator(proxies = [], targetPlatform, context) {
   // 35. sing-box AnyTLS 支持通过节点的字符串字段 `client-metadata` 设置 `client_metadata`
   // 36. sing-box Hysteria 2 支持通过节点的字符串字段 `disable-chrome-parrot` 设置 `disable_chrome_parrot`
   // 37. Surge TrustTunnel 支持使用 Surge 格式写 `h3=true` 作为输入, 或使用节点字段 `network: 'h3'` 设置 `h3=true`
+  // 38. QX 输入的 `tls-alpn` 会保留原始十六进制值(支持带或不带冒号), 同时解码为 `alpn` 数组; QX 输出时优先使用 `tls-alpn`, 否则将 `alpn` 编码为 `tls-alpn`
+  // 39. `_finalmask` 对应 Xray-core 的 `streamSettings.finalmask`. URI `fm` 参数解码后会尝试 JSON.parse, 结果为普通对象时保存对象, 解析失败或结果不是对象时保留原字符串
+  //     手动设置支持普通对象或 JSON 字符串, 不要预先 encodeURIComponent. 例如: $server._finalmask = { udp: [{ type: 'salamander', settings: { password: 'example-password' } }] }
+  //     对象可直接修改, 例如 $server._finalmask.udp[0].settings.password = 'new-example-password'; 移除可用 delete $server._finalmask
+  //     输出 URI(包括 V2Ray 订阅)时, 对象会先 JSON.stringify, 字符串原样使用, 再统一 encodeURIComponent 编码为 `fm`; 其他客户端不输出此字段
+  //     VMess 携带此字段时使用 query 分享格式, 该格式只支持 AEAD(alterId=0), 规范: https://github.com/XTLS/Xray-core/discussions/716
+  // 40. Loon 3.5.2 (996) 起支持 `server-dns`, 用于指定解析节点服务器域名的 DNS, 内部字段同名, 结构为数组. 文档: https://nsloon.app/docs/Node/#节点-dns
+  //     只影响节点服务器域名解析, 不替换全局 DNS; WireGuard 中用于解析 Peer 的 endpoint, 与隧道内的 dns/dnsv6 不同
+  //     支持 system、IPv4/IPv6、IPv4:端口、[IPv6]:端口、https:// (DoH)、quic:// (DoQ)、h3:// (DoH3)
+  //     Loon 文档要求多个 DNS 用双引号包裹; Sub-Store 输入额外兼容不加双引号的列表, 输出始终带双引号
+  //     脚本快捷设置: $server['server-dns'] = ['223.5.5.5', 'https://dns.example.com/dns-query', 'quic://dns.example.com', 'h3://dns.example.com/dns-query']
+  //     移除可用 delete $server['server-dns'], 空数组不输出该字段
+  // 41. sing-box WireGuard/Tailscale 支持 `_on_demand` 设置 `on_demand`, 值为布尔值 `true`/`false`, 允许 endpoint 在需要时断开连接; sing-box 1.15.0 起支持. 例如: $server._on_demand = true
+  // 42. sing-box WireGuard/Tailscale 支持 `_listen_port` 设置本地 UDP 监听端口 `listen_port`, 接受 0–65535 的整数或整数字符串, `0` 表示自动选择; Tailscale 需要 sing-box 1.14.0+. WireGuard 的非零 `listen_port` 不能与 `detour`/`dialer-proxy` 同时使用. 例如: $server._listen_port = 51820
+  // 43. sing-box WireGuard 支持 `_name` 设置系统接口名称 `name`, 配合 `system: true` 使用; 节点的 `name` 仍用于输出 `tag`. 例如: $server._name = 'wg0'
+  // 44. sing-box WireGuard 支持 `_udp_mapping` 设置 `udp_mapping`, 可选 `endpoint_independent`(默认)、`address_dependent`、`address_and_port_dependent`; 控制 UDP NAT 映射复用方式, sing-box 1.14.0 起支持. 例如: $server._udp_mapping = 'endpoint_independent'
+  // 45. sing-box WireGuard 支持 `_udp_filtering` 设置 `udp_filtering`, 可选 `endpoint_independent`(默认)、`address_dependent`、`address_and_port_dependent`; 控制 UDP NAT 接受哪些远端回包, sing-box 1.14.0 起支持. 例如: $server._udp_filtering = 'address_and_port_dependent'
+  // 46. sing-box WireGuard 支持 `_udp_nat_max` 设置 `udp_nat_max`, 接受 0–4294967295 的整数或整数字符串, 限制 UDP NAT 会话数; `0` 使用 sing-box 的平台默认值, sing-box 1.14.0 起支持. 例如: $server._udp_nat_max = 8192
+  // 47. sing-box Tailscale 支持 `_taildrop_directory` 设置接收 Taildrop 文件的目录 `taildrop_directory`, 值为字符串; 相对路径基于 sing-box 工作目录, 默认 `Taildrop`, sing-box 1.14.0 起支持. 例如: $server._taildrop_directory = './taildrop'
 
   // require 为 Node.js 的 require, 在 Node.js 运行环境下 可以用来引入模块
   // 例如在 Node.js 环境下, 将文件内容写入 /tmp/1.txt 文件
@@ -372,6 +395,17 @@ function operator(proxies = [], targetPlatform, context) {
   //    例如 { 'sub-a': ['sub-a raw'], 'sub-b': ['sub-b raw 1', 'sub-b raw 2'] }
   //    如果某个子订阅处理失败并启用失败静默/失败通知, 会保留该 key, value 为 undefined
   //    如果启用静默兜底/通知兜底, 会保留该 key, value 为 []
+
+  // produceArtifact 可通过 includeRaw: true 同时返回处理结果和 context.raw 对应的原始内容
+  // includeRaw 只控制返回值, 不改变传给处理器的原始内容
+  // 适用于 type: 'subscription' / 'sub' / 'collection' / 'col', 不传时仍直接返回处理结果
+  // const { result, raw } = await produceArtifact({
+  //   type: 'subscription', // 使用 collection 时, raw 为按单条订阅 name 分组的对象
+  //   name: 'sub',
+  //   platform: 'ClashMeta',
+  //   produceType: 'internal', // result 为节点数组; 不传 produceType 时为输出字符串
+  //   includeRaw: true,
+  // })
 
   // 其中 source 为 订阅和组合订阅的数据, 有三种情况, 按需判断 (若只需要取订阅/组合订阅名称 直接用 `_subName` `_subDisplayName` `_collectionName` `_collectionDisplayName` 即可)
 

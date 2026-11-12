@@ -31,6 +31,7 @@ import { FILES_KEY, MODULES_KEY } from '@/constants';
 import { findByName } from '@/utils/database';
 import { produceArtifact } from '@/restful/sync';
 import { getFlag, removeFlag, getISO, MMDB } from '@/utils/geo';
+import getFs from '@/runtime/fs';
 import Gist from '@/utils/gist';
 import {
     isShadowsocksOverTls,
@@ -276,6 +277,17 @@ async function processResponseFn(
 }
 
 async function loadScriptItem(item, executionContext = {}) {
+    if (
+        $.env.isNode &&
+        !eval('process.env.SUB_STORE_FRONTEND_BACKEND_PATH')?.startsWith('/') &&
+        !eval('process.env.SUB_STORE_BACKEND_CUSTOM_NAME')
+    ) {
+        const message =
+            'Node.js 环境下，脚本操作、脚本过滤和修改响应必须设置 SUB_STORE_FRONTEND_BACKEND_PATH 才能生效；若不想改变当前 path，可设置 SUB_STORE_FRONTEND_BACKEND_PATH=/';
+        $.error(message);
+        throw new Error(message);
+    }
+
     let script;
     let $arguments = {};
     const { mode, content } = item.args || {};
@@ -341,7 +353,7 @@ async function loadScriptItem(item, executionContext = {}) {
             }
         } else if (url?.startsWith('/')) {
             try {
-                const fs = eval(`require("fs")`);
+                const fs = getFs();
                 script = fs.readFileSync(url.split('#')[0], 'utf8');
                 // $.info(`Script loaded: >>>\n ${script}`);
             } catch (err) {
@@ -769,6 +781,15 @@ function lastParse(proxy) {
         }
         normalizeOpts(proxy[normalizedKey]);
     }
+    if (
+        proxy['reality-opts']?.['public-key'] &&
+        !hasOwn(proxy['reality-opts'], 'support-x25519mlkem768') &&
+        ['safari-ios-26', 'chrome147'].includes(
+            `${proxy._loon_tls_profile || ''}`.trim(),
+        )
+    ) {
+        proxy['reality-opts']['support-x25519mlkem768'] = true;
+    }
     proxy.udp = ![false, 0, '0', 'false', 'off'].includes(
         typeof proxy.udp === 'string' ? proxy.udp.toLowerCase() : proxy.udp,
     );
@@ -849,12 +870,8 @@ function lastParse(proxy) {
         !proxy.plugin
     ) {
         proxy.plugin = 'shadow-tls';
-        proxy['plugin-opts'] = {
-            host: proxy['obfs-opts'].host,
-            password: proxy['obfs-opts'].password,
-            version: proxy['obfs-opts'].version,
-            alpn: proxy['obfs-opts'].alpn,
-        };
+        proxy['plugin-opts'] = { ...proxy['obfs-opts'] };
+        delete proxy['plugin-opts'].mode;
         delete proxy['obfs-opts'];
     }
     if (proxy.plugin === 'shadow-tls' && proxy['plugin-opts']) {

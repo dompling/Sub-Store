@@ -42,6 +42,20 @@ import { initializeExtensionHost } from '@/extensions/host';
 import { loadBundledExtensions } from '@/extensions/bundled';
 import { createConfigHostingRouteApps } from '@/extensions/config-hosting';
 import { EXTENSION_IDS } from '@/extensions/contracts';
+import getFs from '@/runtime/fs';
+import getPath from '@/runtime/path';
+
+export function stripBackendPath(url, backendPath) {
+    return (backendPath === '/' ? url : url.replace(backendPath, '')) || '/';
+}
+
+export function matchesBackendPath(path, backendPath, merge) {
+    if (backendPath !== '/') return path.startsWith(backendPath);
+    return (
+        /^\/(api|download|share)(\/|$)/.test(path) &&
+        (!merge || !path.startsWith('/share/'))
+    );
+}
 
 export default function serve() {
     const { manager: extensionManager } = initializeExtensionHost({
@@ -80,10 +94,14 @@ export default function serve() {
                 $.info(`[BACKEND] MERGE mode is [ON].`);
                 $.info(`[BACKEND && FRONTEND] ${host}:${port}`);
             }
-            $.info(`[BACKEND PREFIX] ${host}:${port}${fe_be_path}`);
+            $.info(
+                `[BACKEND PREFIX] ${host}:${port}${
+                    fe_be_path === '/' ? '' : fe_be_path
+                }`,
+            );
             $app.use((req, res, next) => {
-                if (req.path.startsWith(fe_be_path)) {
-                    req.url = req.url.replace(fe_be_path, '') || '/';
+                if (matchesBackendPath(req.path, fe_be_path, be_merge)) {
+                    req.url = stripBackendPath(req.url, fe_be_path);
                     if (be_merge && req.url.startsWith('/api/')) {
                         req.query['share'] = 'true';
                     }
@@ -122,9 +140,7 @@ export default function serve() {
                         }
                     }
                 }
-                const isBackendRoute = /^\/(api|download|share)(\/|$)/.test(
-                    req.path,
-                );
+                const isBackendRoute = matchesBackendPath(req.path, '/', false);
                 if (mergedFrontend && !isBackendRoute) {
                     mergedFrontend(req, res, next);
                     return;
@@ -374,8 +390,8 @@ export default function serve() {
                 // 'Asia/Shanghai' // timeZone
             );
         }
-        const path = eval(`require("path")`);
-        const fs = eval(`require("fs")`);
+        const path = getPath();
+        const fs = getFs();
         const data_url = eval('process.env.SUB_STORE_DATA_URL');
         const data_url_post = eval('process.env.SUB_STORE_DATA_URL_POST');
         const fe_be_path = eval('process.env.SUB_STORE_FRONTEND_BACKEND_PATH');

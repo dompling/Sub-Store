@@ -125,7 +125,7 @@ async function downloadFileSources({
                     file.proxy || proxy,
                     undefined,
                     undefined,
-                    noCache,
+                    noCache || file.noCache,
                     undefined,
                     { noFlow },
                 );
@@ -288,6 +288,7 @@ async function produceBuiltinArtifact({
     noCache,
     noFlow,
     all,
+    includeRaw,
 }) {
     platform = platform || 'JSON';
 
@@ -317,10 +318,10 @@ async function produceBuiltinArtifact({
             sub.ignoreFailedRemoteSub,
         );
         const skipFlow = noFlow || sub.noFlow;
+        let sourceRaw = [];
 
         try {
             let raw;
-            let sourceRaw;
             if (
                 content &&
                 !['localFirst', 'remoteFirst'].includes(mergeSources)
@@ -457,9 +458,17 @@ async function produceBuiltinArtifact({
                 }
             }
             if (produceType === 'raw') {
-                return JSON.stringify(
+                const result = JSON.stringify(
                     (Array.isArray(raw) ? raw : [raw]).flat(),
                 );
+                return includeRaw
+                    ? {
+                          result,
+                          raw: Array.isArray(sourceRaw)
+                              ? sourceRaw
+                              : [sourceRaw],
+                      }
+                    : result;
             }
             // parse proxies
             let proxies = (Array.isArray(raw) ? raw : [raw])
@@ -501,12 +510,18 @@ async function produceBuiltinArtifact({
                 exist[proxy.name] = true;
             }
             // produce
-            return ProxyUtils.produce(
+            const result = ProxyUtils.produce(
                 proxies,
                 platform,
                 produceType,
                 produceOpts,
             );
+            return includeRaw
+                ? {
+                      result,
+                      raw: Array.isArray(sourceRaw) ? sourceRaw : [sourceRaw],
+                  }
+                : result;
         } catch (err) {
             if (
                 !shouldFallbackIgnoreFailedRemoteSub(subIgnoreFailedRemoteSub)
@@ -529,11 +544,17 @@ async function produceBuiltinArtifact({
                 `订阅 ${sub.name} 启用兜底后返回空结果: ${err.message ?? err}`,
             );
 
-            return buildEmptySubscriptionOutput({
+            const result = buildEmptySubscriptionOutput({
                 platform,
                 produceType,
                 produceOpts,
             });
+            return includeRaw
+                ? {
+                      result,
+                      raw: Array.isArray(sourceRaw) ? sourceRaw : [sourceRaw],
+                  }
+                : result;
         }
     } else if (['collection', 'col'].includes(type)) {
         const allSubs = $.read(SUBS_KEY);
@@ -560,11 +581,11 @@ async function produceBuiltinArtifact({
                 collection.ignoreFailedRemoteSub,
             );
         const skipFlow = noFlow || collection.noFlow;
+        const rawResults = {};
 
         try {
             const results = {};
             const errors = {};
-            const rawResults = {};
             let processed = 0;
 
             await Promise.all(
@@ -820,12 +841,13 @@ async function produceBuiltinArtifact({
                 }
                 exist[proxy.name] = true;
             }
-            return ProxyUtils.produce(
+            const result = ProxyUtils.produce(
                 proxies,
                 platform,
                 produceType,
                 produceOpts,
             );
+            return includeRaw ? { result, raw: rawResults } : result;
         } catch (err) {
             if (
                 !shouldFallbackIgnoreFailedRemoteSub(
@@ -852,11 +874,12 @@ async function produceBuiltinArtifact({
                 }`,
             );
 
-            return buildEmptySubscriptionOutput({
+            const result = buildEmptySubscriptionOutput({
                 platform,
                 produceType,
                 produceOpts,
             });
+            return includeRaw ? { result, raw: rawResults } : result;
         }
     } else if (type === 'rule') {
         const allRules = $.read(RULES_KEY);

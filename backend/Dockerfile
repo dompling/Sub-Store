@@ -1,5 +1,5 @@
 # Keep the Node tag aligned with the repository-root .node-version.
-FROM node:24.15.0-bookworm-slim AS build
+FROM node:24.22.1-bookworm-slim AS build
 
 WORKDIR /build
 
@@ -11,10 +11,13 @@ RUN corepack install \
 
 COPY . .
 
-RUN corepack pnpm bundle:esbuild
+# The backend-only build context does not contain the repository-root file.
+# Record the image runtime used to test the standalone bundle manifest.
+RUN node -p 'process.versions.node' > ../.node-version \
+    && corepack pnpm bundle:esbuild
 
 
-FROM node:24.15.0-bookworm-slim AS runtime
+FROM node:24.22.1-bookworm-slim AS runtime
 
 ENV NODE_ENV=production \
     SUB_STORE_BACKEND_API_HOST=0.0.0.0 \
@@ -27,6 +30,7 @@ RUN mkdir -p /opt/app/data \
     && chown node:node /opt/app/data
 
 COPY --from=build --chown=node:node /build/dist/sub-store.bundle.js ./sub-store.bundle.js
+COPY --from=build --chown=node:node /build/dist/runtime-manifest.json ./runtime-manifest.json
 
 USER node
 

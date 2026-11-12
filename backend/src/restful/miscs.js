@@ -269,7 +269,7 @@ async function gistBackupAction(
         `Gist backup action: ${action}, keep: ${keep}, token strategy: ${queryTokenStrategy}, settings token strategy: ${settings.gistDownloadTokenStrategy}, final token strategy: ${tokenStrategy}, encode: ${encode}, settings encode: ${settings.gistUpload}, final encoding: ${encoding}`,
     );
     switch (action) {
-        case 'upload':
+        case 'upload': {
             let backupContent;
             try {
                 const keepAgeSecretKey = isAgeGistBackupEncoding(encoding);
@@ -326,13 +326,11 @@ async function gistBackupAction(
             $.info(`上传备份中...`);
             await $.wait(100);
             try {
-                await gist.upload(
-                    {
-                        [GIST_BACKUP_FILE_NAME]: {
-                            content: uploadContent,
-                        },
-                    }
-                );
+                await gist.upload({
+                    [GIST_BACKUP_FILE_NAME]: {
+                        content: uploadContent,
+                    },
+                });
 
                 $.info(`上传备份完成`);
             } catch (err) {
@@ -349,7 +347,6 @@ async function gistBackupAction(
                     await $.wait(500);
                     const downloadedContent = await gist.download(
                         GIST_BACKUP_FILE_NAME,
-                        gists,
                     );
 
                     const onlineContent = await decryptGistBackupContent(
@@ -385,6 +382,7 @@ async function gistBackupAction(
                 throw err;
             }
             break;
+        }
         case 'download': {
             $.info(`还原备份中...`);
             content = await gist.download(GIST_BACKUP_FILE_NAME);

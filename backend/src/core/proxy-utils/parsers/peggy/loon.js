@@ -63,9 +63,10 @@ const grammars = String.raw`
     function loonClientFingerprint(tlsProfile) {
         switch (String(tlsProfile || "").trim()) {
             case "chrome":
+            case "chrome147":
                 return "chrome";
-            case "ios18":
-            case "ios26":
+            case "safari-ios18":
+            case "safari-ios-26":
                 return "ios";
         }
     }
@@ -262,12 +263,19 @@ max_stream_count = comma "max-stream-count" equals match:$[0-9]+ { proxy["max-st
 
 udp_over_tcp = comma "udp-over-tcp" equals flag:bool { proxy["udp-over-tcp"] = true; proxy["udp-over-tcp-version"] = 2; }
 
+server_dns = comma "server-dns" equals value:(
+    '"' match:$[^"]* '"' { return match; }
+    / $(!(comma [a-zA-Z0-9_-]+ equals) [^"])*
+) {
+    proxy["server-dns"] = value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
 tag = match:[^=,]* { proxy.name = match.join("").trim(); }
 comma = _ "," _
 equals = _ "=" _
 _ = [ \r\t]*
 bool = b:("true"/"false") { return b === "true" }
-others = comma [^=,]+ equals [^=,]+
+others = server_dns / (comma [^=,]+ equals [^=,]+)
 `;
 let parser;
 export default function getParser() {

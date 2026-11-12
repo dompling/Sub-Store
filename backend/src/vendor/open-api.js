@@ -1,5 +1,6 @@
 /* eslint-disable no-undef */
 import { installConsoleLogCapture } from '@/utils/debug-logs';
+import getFs from '@/runtime/fs';
 
 const isQX = typeof $task !== 'undefined';
 const isLoon = typeof $loon !== 'undefined';
@@ -78,7 +79,7 @@ export class OpenAPI {
         }
         this.node = (() => {
             if (isNode) {
-                const fs = eval("require('fs')");
+                const fs = getFs();
 
                 return {
                     fs,
@@ -332,33 +333,25 @@ export class OpenAPI {
                             );
                         });
                 } else {
-                    const { execFile } = eval(`require("child_process")`);
-                    execFile(
-                        'shoutrrr',
-                        [
-                            'send',
-                            '--url',
-                            push,
-                            '--message',
-                            `${title}\n${subtitle}\n${content_}`,
-                        ],
-                        (error, stdout, stderr) => {
-                            if (error) {
-                                console.log(
-                                    `[Push Service] URL: ${push}\nERROR: ${error}`,
-                                );
-                                return;
-                            }
-                            if (stderr) {
-                                console.log(
-                                    `[Push Service] URL: ${push}\nstderr: ${stderr}`,
-                                );
-                            }
+                    // Keep the ESM package out of browser artifacts; the Node bundle
+                    // replaces this evaluated import with a bundled dynamic import.
+                    eval('import("shoutrrr-ts")')
+                        .then(({ send }) =>
+                            send(push, `${title}\n${subtitle}\n${content_}`, {
+                                transport: createNotificationTransport(HTTP()),
+                            }).then(
+                                () => console.log('[Push Service] RES: sent'),
+                                (error) =>
+                                    console.log(
+                                        `[Push Service] ERROR: ${error.message}`,
+                                    ),
+                            ),
+                        )
+                        .catch(() =>
                             console.log(
-                                `[Push Service] URL: ${push}\nstdout: ${stdout}`,
-                            );
-                        },
-                    );
+                                '[Push Service] ERROR: notification delivery failed',
+                            ),
+                        );
                 }
             }
         }
@@ -412,6 +405,39 @@ export function ENV() {
         isEgern,
         isLanceX,
         isGUIforCores,
+    };
+}
+
+// Keep notification requests on the same proxy/timeout policy as other Node HTTP calls.
+// HTTP() follows redirects with Undici's redirect interceptor, which strips
+// authorization/cookie headers on cross-origin redirects. Its timeout bounds
+// the observed outcome but does not prove the underlying request was aborted.
+function createNotificationTransport(client) {
+    return async (url, init = {}) => {
+        const body = init.body;
+        if (
+            body != null &&
+            typeof body !== 'string' &&
+            !(body instanceof Uint8Array) &&
+            !(body instanceof ArrayBuffer)
+        ) {
+            throw new Error('unsupported notification request body');
+        }
+        const headers = Object.fromEntries(new Headers(init.headers).entries());
+        const response = await client.request({
+            url,
+            method: init.method || 'GET',
+            headers,
+            body: body instanceof ArrayBuffer ? new Uint8Array(body) : body,
+            encoding: null,
+            timeout: 8000,
+        });
+        return new Response(
+            [204, 205, 304].includes(response.statusCode)
+                ? null
+                : response.body,
+            { status: response.statusCode },
+        );
     };
 }
 
@@ -532,9 +558,9 @@ export function HTTP(defaultOptions = { baseURL: '' }) {
                             opts.headers = {
                                 ...(opts.headers || {}),
                                 Authorization: `Basic ${Buffer.from(
-                                    `${url.username || ''}:${
-                                        url.password || ''
-                                    }`,
+                                    `${decodeURIComponent(
+                                        url.username,
+                                    )}:${decodeURIComponent(url.password)}`,
                                 ).toString('base64')}`,
                             };
                         }
@@ -725,7 +751,7 @@ export function HTTP(defaultOptions = { baseURL: '' }) {
                 },
             );
 
-            if (timeout && !isEgern) {
+            if (timeout) {
                 timeoutid = setTimeout(() => {
                     if (settled) {
                         return;

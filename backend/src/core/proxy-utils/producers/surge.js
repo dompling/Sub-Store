@@ -202,6 +202,8 @@ export default function Surge_Producer() {
                 return ssh(proxy);
             case 'trusttunnel':
                 return trusttunnel(proxy);
+            case 'masque-surge':
+                return masque_surge(proxy);
         }
 
         if (opts['include-unsupported-proxy'] && proxy.type === 'wireguard') {
@@ -360,9 +362,6 @@ function trojan(proxy) {
     // tfo
     result.appendIfPresent(`,tfo=${proxy.tfo}`, 'tfo');
 
-    // udp
-    result.appendIfPresent(`,udp-relay=${proxy.udp}`, 'udp');
-
     // test-url
     result.appendIfPresent(`,test-url=${proxy['test-url']}`, 'test-url');
     result.appendIfPresent(
@@ -414,9 +413,6 @@ function anytls(proxy) {
 
     // tfo
     result.appendIfPresent(`,tfo=${proxy.tfo}`, 'tfo');
-
-    // udp
-    result.appendIfPresent(`,udp-relay=${proxy.udp}`, 'udp');
 
     // test-url
     result.appendIfPresent(`,test-url=${proxy['test-url']}`, 'test-url');
@@ -478,9 +474,6 @@ function trusttunnel(proxy) {
     // tfo
     result.appendIfPresent(`,tfo=${proxy.tfo}`, 'tfo');
 
-    // udp
-    result.appendIfPresent(`,udp-relay=${proxy.udp}`, 'udp');
-
     // test-url
     result.appendIfPresent(`,test-url=${proxy['test-url']}`, 'test-url');
     result.appendIfPresent(
@@ -511,6 +504,60 @@ function trusttunnel(proxy) {
 
     // reuse
     result.appendIfPresent(`,reuse=${proxy['reuse']}`, 'reuse');
+
+    return result.toString();
+}
+function masque_surge(proxy) {
+    const result = new Result(proxy);
+    result.append(`${proxy.name}=masque,${proxy.server},${proxy.port}`);
+    result.appendIfPresent(`,username="${proxy.username}"`, 'username');
+    result.appendIfPresent(`,password="${proxy.password}"`, 'password');
+
+    if (hasNonBlankValue(proxy.ports)) {
+        result.append(
+            `,port-hopping="${String(proxy.ports).replace(/,/g, ';')}"`,
+        );
+    }
+    if (hasNonBlankValue(proxy['hop-interval'])) {
+        result.append(`,port-hopping-interval=${proxy['hop-interval']}`);
+    }
+
+    const ip_version = ipVersions[proxy['ip-version']] || proxy['ip-version'];
+    result.appendIfPresent(`,ip-version=${ip_version}`, 'ip-version');
+    result.appendIfPresent(
+        `,no-error-alert=${proxy['no-error-alert']}`,
+        'no-error-alert',
+    );
+    appendTlsProxyParams(result, proxy);
+
+    if (isPresent(proxy, 'tfo')) {
+        result.append(`,tfo=${proxy.tfo}`);
+    } else if (isPresent(proxy, 'fast-open')) {
+        result.append(`,tfo=${proxy['fast-open']}`);
+    }
+    result.appendIfPresent(`,test-url=${proxy['test-url']}`, 'test-url');
+    result.appendIfPresent(
+        `,test-timeout=${proxy['test-timeout']}`,
+        'test-timeout',
+    );
+    result.appendIfPresent(`,test-udp=${proxy['test-udp']}`, 'test-udp');
+    result.appendIfPresent(`,hybrid=${proxy.hybrid}`, 'hybrid');
+    result.appendIfPresent(`,tos=${proxy.tos}`, 'tos');
+    result.appendIfPresent(
+        `,allow-other-interface=${proxy['allow-other-interface']}`,
+        'allow-other-interface',
+    );
+    result.appendIfPresent(
+        `,interface=${proxy['interface-name']}`,
+        'interface-name',
+    );
+    result.appendIfPresent(`,interface=${proxy.interface}`, 'interface');
+    result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
+    result.appendIfPresent(
+        `,underlying-proxy=${proxy['underlying-proxy']}`,
+        'underlying-proxy',
+    );
+    result.appendIfPresent(`,ecn=${proxy.ecn}`, 'ecn');
 
     return result.toString();
 }
@@ -606,9 +653,6 @@ function vmess(proxy, includeUnsupportedProxy) {
     // tfo
     result.appendIfPresent(`,tfo=${proxy.tfo}`, 'tfo');
 
-    // udp
-    result.appendIfPresent(`,udp-relay=${proxy.udp}`, 'udp');
-
     // test-url
     result.appendIfPresent(`,test-url=${proxy['test-url']}`, 'test-url');
     result.appendIfPresent(
@@ -672,9 +716,6 @@ function ssh(proxy) {
     // tfo
     result.appendIfPresent(`,tfo=${proxy.tfo}`, 'tfo');
 
-    // udp
-    result.appendIfPresent(`,udp-relay=${proxy.udp}`, 'udp');
-
     // test-url
     result.appendIfPresent(`,test-url=${proxy['test-url']}`, 'test-url');
     result.appendIfPresent(
@@ -727,9 +768,6 @@ function http(proxy) {
     // tfo
     result.appendIfPresent(`,tfo=${proxy.tfo}`, 'tfo');
 
-    // udp
-    result.appendIfPresent(`,udp-relay=${proxy.udp}`, 'udp');
-
     // test-url
     result.appendIfPresent(`,test-url=${proxy['test-url']}`, 'test-url');
     result.appendIfPresent(
@@ -777,9 +815,6 @@ function direct(proxy) {
 
     // tfo
     result.appendIfPresent(`,tfo=${proxy.tfo}`, 'tfo');
-
-    // udp
-    result.appendIfPresent(`,udp-relay=${proxy.udp}`, 'udp');
 
     // test-url
     result.appendIfPresent(`,test-url=${proxy['test-url']}`, 'test-url');
@@ -933,9 +968,6 @@ function snell(proxy) {
 
     // tfo
     result.appendIfPresent(`,tfo=${proxy.tfo}`, 'tfo');
-
-    // udp
-    result.appendIfPresent(`,udp-relay=${proxy.udp}`, 'udp');
 
     // test-url
     result.appendIfPresent(`,test-url=${proxy['test-url']}`, 'test-url');

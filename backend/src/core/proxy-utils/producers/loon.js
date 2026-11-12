@@ -56,7 +56,15 @@ export default function Loon_Producer() {
             `Platform ${targetPlatform} does not support proxy type: ${proxy.type}`,
         );
     };
-    return { produce };
+    return {
+        produce: (proxy, type, opts = {}) => {
+            const result = produce(proxy, type, opts);
+            const serverDns = proxy['server-dns'];
+            return Array.isArray(serverDns) && serverDns.length > 0
+                ? `${result},server-dns="${serverDns.join(',')}"`
+                : result;
+        },
+    };
 }
 
 function appendTlsProfile(result, proxy) {
@@ -71,7 +79,9 @@ function appendAlpn(result, proxy) {
 
 function getLoonShadowTLSAlpn(proxy) {
     const values = proxy?.['plugin-opts']?.alpn ?? proxy?.alpn;
-    const normalized = Array.isArray(values) ? values : `${values || ''}`.split(',');
+    const normalized = Array.isArray(values)
+        ? values
+        : `${values || ''}`.split(',');
     return normalized
         .map((item) => `${item}`.trim())
         .filter((item) => item !== '')
@@ -124,15 +134,32 @@ function getLoonAlpn(proxy) {
 
 function getLoonTlsProfile(proxy) {
     const tlsProfile = `${proxy._loon_tls_profile || ''}`.trim();
-    if (['default', 'chrome', 'ios18', 'ios26'].includes(tlsProfile)) {
+    if (
+        [
+            'global',
+            'default',
+            'safari-ios18',
+            'safari-ios-26',
+            'chrome',
+            'chrome147',
+        ].includes(tlsProfile)
+    ) {
         return tlsProfile;
     }
 
-    switch (`${proxy['client-fingerprint'] || ''}`.trim()) {
+    const fingerprint = `${proxy['client-fingerprint'] || ''}`.trim();
+    if (proxy['reality-opts']?.['support-x25519mlkem768']) {
+        return ['safari', 'ios'].includes(fingerprint)
+            ? 'safari-ios-26'
+            : 'chrome147';
+    }
+
+    switch (fingerprint) {
         case 'chrome':
             return 'chrome';
+        case 'safari':
         case 'ios':
-            return 'ios26';
+            return 'safari-ios18';
     }
 }
 

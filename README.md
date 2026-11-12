@@ -7,19 +7,24 @@
 
 [![Build](https://github.com/sub-store-org/Sub-Store/actions/workflows/main.yml/badge.svg)](https://github.com/sub-store-org/Sub-Store/actions/workflows/main.yml) ![GitHub](https://img.shields.io/github/license/sub-store-org/Sub-Store) ![GitHub issues](https://img.shields.io/github/issues/sub-store-org/Sub-Store) ![GitHub closed pull requests](https://img.shields.io/github/issues-pr-closed-raw/Peng-Ym/Sub-Store) ![Size](https://img.shields.io/github/languages/code-size/sub-store-org/Sub-Store)
 <br>
-<a href="https://trendshift.io/repositories/4572" target="_blank"><img src="https://trendshift.io/api/badge/repositories/4572" alt="sub-store-org%2FSub-Store | Trendshift" height="25"/></a>
-<a href="https://www.buymeacoffee.com/PengYM" target="_blank"><img src="https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png" alt="Buy Me A Coffee" height="25"/></a>
+<a href="https://trendshift.io/repositories/4572" target="_blank"><img src="https://trendshift.io/api/badge/repositories/4572" alt="sub-store-org%2FSub-Store | Trendshift" height="20"/></a>
+<a href="https://www.buymeacoffee.com/PengYM" target="_blank"><img src="https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png" alt="Buy Me A Coffee" height="20"/></a></a>
+[![联系推广](https://img.shields.io/badge/%E8%81%94%E7%B3%BB%E6%8E%A8%E5%B9%BF-26A5E4?style=flat&logo=telegram&logoColor=white)](https://t.me/xream_bot)
 
 <table>
 <tbody>
 <tr>
+<td width="180"><a href="https://mtnapi.com/r/cvctl"><img src="./assets/banners/mtnapi.png" alt="Thordata" width="150"></a></td>
+<td><a href="https://mtnapi.com/r/cvctl">千山算力</a> 是一家稳定、低价的 AI 服务中转商，GPT 模型最低倍率 0.07x，支持 GPT 2.6 最新生图模型，价格最低 0.05/张，每周四限时活动，不定期开展福利，支持开票，欢迎广大用户接入。<a href="https://mtnapi.com/r/cvctl">注册使用</a></td>
+</tr>
+<tr>
 <td width="180"><a href="https://api.muteki.site/register?aff=XREAM&promo=XREAM"><img src="./assets/banners/MaruCode.jpg" alt="MaruCode" width="150"></a></td>
-<td><a href="https://api.muteki.site/register?aff=XREAM&promo=XREAM">MaruCode</a> 是一家偶尔做做慈善的小破站 API，自营号池，不搞充值营销套路，主要提供 Codex、Claude Code、GPT Image-2 等主流模型，支持 WebSocket 协议，明码标价(Codex 0.25x, CC 1.5x)，透明汇率(1:1)，<a href="https://api.muteki.site/register?aff=XREAM&promo=XREAM">新用户注册</a> 送 2 刀 💰 <a href="https://images-2.muteki.site">生图工作台 🖼</a></td>
+<td><a href="https://api.muteki.site/register?aff=XREAM&promo=XREAM">MaruCode</a> 是一家偶尔做做慈善的小破站 API，自营号池，不搞充值营销套路，主要提供 Codex、Claude Code、GPT Image-2 等主流模型，支持 WebSocket 协议，明码标价(Codex 0.3x, CC 1.5x)，透明汇率(1:1)，<a href="https://api.muteki.site/register?aff=XREAM&promo=XREAM">新用户注册</a> 送 2 刀 💰 <a href="https://images-2.muteki.site">生图工作台 🖼</a></td>
 </tr>
 </tbody>
 </table>
 
-[📚 文档/DOC](https://github.com/sub-store-org/Sub-Store/wiki)
+📚 [文档/Doc](https://sub-store-org.github.io/doc) 🆕, [Wiki](https://github.com/sub-store-org/Sub-Store/wiki)
 
 ## sub.store Domain Safety Notice
 
@@ -55,9 +60,17 @@ sub.store = 127.0.0.1
 
 Sub-Store also supports a configurable browser CORS allowlist for the backend API. This does not change the module rewrite domain, but it limits which browser origins can read API responses through CORS.
 
-- Node/server deployments use `SUB_STORE_CORS_ALLOWED_ORIGINS`; the default is `*` for compatibility.
+- Node/server deployments use `SUB_STORE_CORS_ALLOWED_ORIGINS`; the default is `https://sub-store.vercel.app,http://substore.stash,https://substore.stash`.
 - Proxy App modules use the `cors` module argument; the default is `https://sub-store.vercel.app,http://substore.stash,https://substore.stash`.
 - Multiple origins can be separated by commas. Origins are matched exactly by scheme, host, and port. Set the value to `*` only when you accept the risk of any website reading the local backend through browser CORS.
+
+## Node push notifications
+
+For Node deployments, `SUB_STORE_PUSH_SERVICE` accepts a Shoutrrr URL or an existing HTTP/HTTPS URL template. Shoutrrr URLs are sent in-process with [shoutrrr-ts](https://github.com/Delusions6515/shoutrrr-ts); a separate `shoutrrr` executable is no longer used or required. HTTP/HTTPS URL templates still use the existing request path and `[推送标题]` / `[推送内容]` placeholders.
+
+The supported Shoutrrr URL families are Generic Webhook (`generic://`, `generic+https://`, `generic+http://`), Bark, Discord, Gotify, Google Chat (`hangouts://` alias), IFTTT, Join, Mattermost, ntfy, OpsGenie, Pushover, Pushbullet, Rocket.Chat, Slack, Microsoft Teams, Telegram, and Zulip. **Matrix (`matrix://`) and SMTP (`smtp://`) are not supported, and there is no fallback to the old executable.** Check existing configurations before upgrading; unsupported URLs produce a notification error instead of sending. See [upstream compatibility details](https://github.com/Delusions6515/shoutrrr-ts/blob/main/COMPATIBILITY.md) for URL options and caveats. Upstream checks use local Go-compatibility fixtures, not verified live delivery to every provider. The backend's tested Node version is in `.node-version`; check the upstream package for its current Node support.
+
+Push URLs may contain secrets: treat `SUB_STORE_PUSH_SERVICE` as privileged configuration. Diagnostics from the Shoutrrr path do not print the configured URL. This change does not alter the HTTP/HTTPS URL template path or its existing logging behavior.
 
 ## Core functionalities:
 
@@ -87,8 +100,8 @@ Sub-Store also supports a configurable browser CORS allowlist for the backend AP
   > [NaiveProxy](https://telegram.me/zhetengsha/4308)
 - [x] QX (SS, SSR, VMess, Trojan, HTTP, SOCKS5, VLESS, AnyTLS)
 - [x] Loon (SS, SSR, VMess, Trojan, HTTP, SOCKS5, SOCKS5-TLS, WireGuard, VLESS, Hysteria 2, AnyTLS)
-- [x] Surge (Direct, SS, VMess, Trojan, HTTP, HTTPS, HTTP/2 CONNECT, SOCKS5, SOCKS5-TLS, AnyTLS, TrustTunnel, TUIC, Snell, Hysteria 2, SSH(Password authentication only), External Proxy Program(only for macOS), WireGuard(Surge to Surge))
-- [x] mihomo(Clash.Meta) Compatible (Direct, SS, SSR, VMess, Trojan, HTTP, SOCKS5, Snell, VLESS, WireGuard, Hysteria, Hysteria 2, TUIC, SSH, mieru, sudoku, AnyTLS, MASQUE, Tailscale, GOST Relay, Shadow QUIC, ZeroTier)
+- [x] Surge (Direct, SS, VMess, Trojan, HTTP, HTTPS, HTTP/2 CONNECT, SOCKS5, SOCKS5-TLS, AnyTLS, TrustTunnel, TUIC, Snell, Hysteria 2, MASQUE(Surge), SSH(Password authentication only), External Proxy Program(only for macOS), WireGuard(Surge to Surge))
+- [x] mihomo(Clash.Meta) Compatible (Direct, SS, SSR, VMess, Trojan, HTTP, SOCKS5, Snell, VLESS, WireGuard, Hysteria, Hysteria 2, TUIC, SSH, mieru, sudoku, AnyTLS, MASQUE, Tailscale, GOST Relay, Shadow QUIC, ZeroTier, OpenVPN)
 
 Deprecated(The frontend doesn't show it, but the backend still supports it, with the query parameter `target=Clash`):
 
@@ -286,7 +299,7 @@ and release-workflow hook are available in GitHub Actions.
 
 ## LICENSE
 
-This project is under the GPL V3 LICENSE.
+This project is under the AGPL-3.0 LICENSE.
 
 [![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FPeng-YM%2FSub-Store.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2FPeng-YM%2FSub-Store?ref=badge_large)
 

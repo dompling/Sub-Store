@@ -13,6 +13,7 @@ import {
 } from './contracts';
 import { diagnosticDigest, isSha256Digest, sha256Hex } from './signature';
 import { compare as compareSemver, valid as validSemver } from 'semver';
+import { Buffer } from 'buffer';
 
 export const EXTENSION_SOURCE_SCHEMA_VERSION = 1;
 export const MAX_EXTENSION_SOURCE_BYTES = 4 * 1024 * 1024;
@@ -320,14 +321,7 @@ async function readResponseBody(response) {
     }
     if (typeof TextDecoder === 'function')
         return new TextDecoder().decode(bytes);
-    const buffer = nodeModule('buffer')?.Buffer;
-    if (buffer) return buffer.from(bytes).toString('utf8');
-    throw sourceError(
-        'EXTENSION_SOURCE_FETCH_UNAVAILABLE',
-        'UTF-8 response decoding is unavailable',
-        {},
-        503,
-    );
+    return Buffer.from(bytes).toString('utf8');
 }
 
 async function assertSafeNetworkTarget(
