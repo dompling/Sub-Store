@@ -122,11 +122,23 @@ export const RESOURCE_BROKER_HOST_CAPABILITY = Object.freeze({
     implementation: 'host-resource-broker',
 });
 
-export function extensionHostCapabilities({ resourceBroker = false } = {}) {
+export const SCHEDULER_CRON_HOST_CAPABILITY = Object.freeze({
+    status: 'available',
+    complete: true,
+    implementation: 'host-extension-cronjob',
+});
+
+export function extensionHostCapabilities({
+    resourceBroker = false,
+    scheduler = false,
+} = {}) {
     return {
         ...clone(DEFAULT_EXTENSION_HOST_CAPABILITIES),
         ...(resourceBroker
             ? { 'resource-broker@1': clone(RESOURCE_BROKER_HOST_CAPABILITY) }
+            : {}),
+        ...(scheduler
+            ? { 'scheduler.cron@1': clone(SCHEDULER_CRON_HOST_CAPABILITY) }
             : {}),
     };
 }
@@ -2793,8 +2805,29 @@ export class ExtensionManager {
         });
     }
 
+    _disposeExtensionResources(extensionId) {
+        try {
+            this.hostBindings.disposeExtension?.(extensionId);
+        } catch (error) {
+            return error;
+        }
+        return null;
+    }
+
     _activateRecord(record) {
         this._preflightManifest(this.getManifest(record.extensionId));
+        // Jobs left by an earlier activation (or an older package version)
+        // must never survive into this one.
+        this._disposeExtensionResources(record.extensionId);
+        try {
+            return this._activateRecordUnchecked(record);
+        } catch (error) {
+            this._disposeExtensionResources(record.extensionId);
+            throw error;
+        }
+    }
+
+    _activateRecordUnchecked(record) {
         const facade = this._hostFacade(record.extensionId);
         if (this.packageStore && record.entrypoint) {
             const runtimeModule = this.packageStore.load(record);
@@ -2872,6 +2905,12 @@ export class ExtensionManager {
                 } catch (error) {
                     errors.push(error);
                 }
+                // Host-owned jobs stop even when the package deactivate hook
+                // threw or never cleaned up after itself.
+                const disposeError = this._disposeExtensionResources(
+                    record.extensionId,
+                );
+                if (disposeError) errors.push(disposeError);
             }
             return { active: false, errors };
         }
@@ -2886,6 +2925,10 @@ export class ExtensionManager {
         } catch (error) {
             errors.push(error);
         }
+        const disposeError = this._disposeExtensionResources(
+            record.extensionId,
+        );
+        if (disposeError) errors.push(disposeError);
         return { active: false, errors };
     }
 

@@ -54,13 +54,17 @@ function coreSource({ id, type, contract, storageKey, store }) {
                     lifecycle: { state: 'active' },
                 };
             },
-            produce({ id: resourceId, produceBuiltinArtifact }) {
+            produce({ id: resourceId, freshnessPolicy, produceBuiltinArtifact }) {
+                // `fresh` must reach the download layer. Without it a cached
+                // upstream response keeps the previous revision and callers
+                // cannot tell a re-check from the last snapshot.
                 return produceBuiltinArtifact({
                     type,
                     name: resourceId,
                     platform: 'JSON',
                     produceType: 'internal',
                     noFlow: true,
+                    noCache: freshnessPolicy === 'fresh',
                 });
             },
         },

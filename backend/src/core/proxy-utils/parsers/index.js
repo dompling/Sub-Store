@@ -1989,14 +1989,14 @@ function URI_VLESS() {
             }
             if (params.serviceName) {
                 opts[`${proxy.network}-service-name`] = params.serviceName;
-                if (['grpc'].includes(proxy.network) && params.authority) {
-                    opts['_grpc-authority'] = params.authority;
-                }
             } else if (isShadowrocket && params.path) {
                 if (!['ws', 'http', 'h2'].includes(proxy.network)) {
                     opts[`${proxy.network}-service-name`] = params.path;
                     delete params.path;
                 }
+            }
+            if (proxy.network === 'grpc' && params.authority) {
+                opts['_grpc-authority'] = params.authority;
             }
             if (params.path) {
                 let transportPath = params.path;
@@ -2998,6 +2998,13 @@ function Surge_VMess() {
     return { name, test, parse };
 }
 
+function Surge_VLESS() {
+    const name = 'Surge VLESS Parser';
+    const test = (line) => /^.*=\s*vless\s*$/.test(line.split(',')[0]);
+    const parse = (line) => getSurgeParser().parse(line);
+    return { name, test, parse };
+}
+
 function Surge_Trojan() {
     const name = 'Surge Trojan Parser';
     const test = (line) => {
@@ -3178,6 +3185,7 @@ export default [
     Surge_SSH(),
     Surge_SS(),
     Surge_VMess(),
+    Surge_VLESS(),
     Surge_Trojan(),
     Surge_Http(),
     Surge_Snell(),

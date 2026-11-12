@@ -369,7 +369,7 @@ const grammars = String.raw`
     }
 }
 
-start = (masque/anytls/shadowsocks/vmess/trojan/h2_connect/https/http/snell/socks5/socks5_tls/tuic/tuic_v5/wireguard/hysteria2/ssh/trust_tunnel/direct) {
+start = (masque/anytls/shadowsocks/vmess/vless/trojan/h2_connect/https/http/snell/socks5/socks5_tls/tuic/tuic_v5/wireguard/hysteria2/ssh/trust_tunnel/direct) {
     return proxy;
 }
 
@@ -395,6 +395,12 @@ vmess = tag equals "vmess" address (vmess_uuid/vmess_aead/ws/ws_path/ws_headers/
     }
     handleWebsocket();
     handleShadowTLS();
+}
+vless = tag equals "vless" address (vless_uuid/vless_flow/vless_encryption/reality_public_key/reality_short_id/vless_ws/ws_path/ws_headers/grpc/grpc_service_name/grpc_mode/grpc_authority/tls/sni/cert_verify_name/alpn/tls_fingerprint/tls_verification/client_cert/ip_version/underlying_proxy/tos/allow_other_interface/interface/test_url/test_udp/test_timeout/hybrid/no_error_alert/fast_open/tfo/udp_relay/block_quic/others)* {
+    proxy.type = "vless";
+    handleWebsocket();
+    if ($.grpc) proxy.network = "grpc";
+    if (proxy['reality-opts'] && proxy['reality-opts']['public-key']) proxy.tls = true;
 }
 trojan = tag equals "trojan" address (passwordk/ws/ws_path/ws_headers/tls/sni/cert_verify_name/alpn/tls_fingerprint/tls_verification/client_cert/ip_version/underlying_proxy/tos/allow_other_interface/interface/test_url/test_udp/test_timeout/hybrid/no_error_alert/fast_open/tfo/udp_relay/shadow_tls_version/shadow_tls_sni/shadow_tls_password/block_quic/others)* {
     proxy.type = "trojan";
@@ -558,6 +564,16 @@ usernamek = comma "username" equals match:[^,]+ { proxy.username = match.join(""
 passwordk = comma "password" equals match:[^,]+ { proxy.password = match.join("").replace(/^"(.*?)"$/, '$1').replace(/^'(.*?)'$/, '$1'); }
 vmess_uuid = comma "username" equals match:[^,]+ { proxy.uuid = match.join(""); }
 vmess_aead = comma "vmess-aead" equals flag:bool { proxy.aead = flag; }
+vless_uuid = comma "username" equals value:quoted_value { proxy.uuid = value.trim(); }
+vless_flow = comma "flow" equals value:quoted_value { proxy.flow = value.trim(); }
+vless_encryption = comma "encryption" equals value:quoted_value { proxy.encryption = value.trim(); }
+reality_public_key = comma "reality-public-key" equals value:quoted_value { $set(proxy, "reality-opts.public-key", value.trim()); }
+reality_short_id = comma "reality-short-id" equals value:(quoted_value / "") { $set(proxy, "reality-opts.short-id", value.trim()); }
+vless_ws = comma "ws" equals flag:bool { if (flag) obfs.type = "ws"; }
+grpc = comma "grpc" equals flag:bool { $.grpc = flag; }
+grpc_service_name = comma "grpc-service-name" equals value:quoted_value { $set(proxy, "grpc-opts.grpc-service-name", value); }
+grpc_mode = comma "grpc-mode" equals value:quoted_value { $set(proxy, "grpc-opts._grpc-type", value.trim()); }
+grpc_authority = comma "grpc-authority" equals value:quoted_value { $set(proxy, "grpc-opts._grpc-authority", value.trim()); }
 
 method = comma "encrypt-method" equals cipher:cipher {
     proxy.cipher = cipher;

@@ -1074,6 +1074,7 @@ describe('Proxy text producers', function () {
             { type: 'ssh' },
             { type: 'direct' },
             { type: 'vmess', uuid: UUID },
+            { type: 'vless', uuid: UUID },
             { type: 'trojan' },
             { type: 'anytls' },
             { type: 'masque-surge' },
@@ -2284,6 +2285,7 @@ describe('Proxy text producers', function () {
                 tls: true,
                 network: 'ws',
                 'ws-opts': {
+                    'v2ray-http-upgrade': true,
                     path: '/ws',
                     headers: {
                         Host: 'cdn.example.com',

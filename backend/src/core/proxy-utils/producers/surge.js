@@ -181,7 +181,8 @@ export default function Surge_Producer() {
             case 'trojan':
                 return trojan(proxy);
             case 'vmess':
-                return vmess(proxy, opts['include-unsupported-proxy']);
+            case 'vless':
+                return vmessOrVless(proxy, opts['include-unsupported-proxy']);
             case 'http':
                 return http(proxy);
             case 'h2-connect':
@@ -617,13 +618,22 @@ function h2Connect(proxy) {
     return result.toString();
 }
 
-function vmess(proxy, includeUnsupportedProxy) {
+function vmessOrVless(proxy, includeUnsupportedProxy) {
+    const isVless = proxy.type === 'vless';
     const result = new Result(proxy);
     result.append(`${proxy.name}=${proxy.type},${proxy.server},${proxy.port}`);
-    result.appendIfPresent(`,username=${proxy.uuid}`, 'uuid');
-    const encryptMethod = formatSurgeVmessEncryptMethod(proxy.cipher);
-    if (encryptMethod) {
-        result.append(`,encrypt-method=${encryptMethod}`);
+    const username =
+        isVless && /[,\s]/.test(proxy.uuid)
+            ? quoteSurgeValue(proxy.uuid)
+            : proxy.uuid;
+    result.appendIfPresent(`,username=${username}`, 'uuid');
+    if (isVless) {
+        appendVlessParams(result, proxy);
+    } else {
+        const encryptMethod = formatSurgeVmessEncryptMethod(proxy.cipher);
+        if (encryptMethod) {
+            result.append(`,encrypt-method=${encryptMethod}`);
+        }
     }
 
     const ip_version = ipVersions[proxy['ip-version']] || proxy['ip-version'];
@@ -635,20 +645,28 @@ function vmess(proxy, includeUnsupportedProxy) {
     );
 
     // transport
-    handleTransport(result, proxy, includeUnsupportedProxy);
+    if (!isVless || proxy.network === 'ws') {
+        handleTransport(result, proxy, includeUnsupportedProxy);
+    }
 
     // AEAD
-    if (isPresent(proxy, 'aead')) {
-        result.append(`,vmess-aead=${proxy.aead}`);
-    } else {
-        result.append(`,vmess-aead=${proxy.alterId === 0}`);
+    if (!isVless) {
+        if (isPresent(proxy, 'aead')) {
+            result.append(`,vmess-aead=${proxy.aead}`);
+        } else {
+            result.append(`,vmess-aead=${proxy.alterId === 0}`);
+        }
     }
 
     // tls
     result.appendIfPresent(`,tls=${proxy.tls}`, 'tls');
 
     // tls verification
-    appendTlsProxyParams(result, proxy, Boolean(proxy.tls));
+    appendTlsProxyParams(
+        result,
+        proxy,
+        Boolean(proxy.tls || (isVless && proxy['reality-opts'])),
+    );
 
     // tfo
     result.appendIfPresent(`,tfo=${proxy.tfo}`, 'tfo');
@@ -1320,6 +1338,67 @@ function hysteria2(proxy) {
     result.appendIfPresent(`,ecn=${proxy.ecn}`, 'ecn');
 
     return result.toString();
+}
+
+function appendVlessParams(result, proxy) {
+    // https://manual.nssurge.com/policies/vless.html
+    if (hasNonBlankValue(proxy._finalmask)) {
+        // Neither native Surge nor the Mihomo fallback can preserve this mask.
+        throw new Error('VLESS finalmask cannot be represented on Surge');
+    }
+    const network = proxy.network === 'raw' ? 'tcp' : proxy.network || 'tcp';
+    const reality = proxy['reality-opts'];
+    const secure = proxy.tls || reality;
+    if (!['tcp', 'ws', 'grpc'].includes(network)) {
+        throw unsupported(`VLESS network ${network} is unsupported`);
+    }
+    if (hasNonBlankValue(proxy.encryption) && proxy.encryption !== 'none') {
+        throw unsupported('VLESS Encryption is unsupported');
+    }
+    if (reality && network === 'ws') {
+        throw unsupported('VLESS WebSocket with REALITY is unsupported');
+    }
+    if (network === 'grpc' && !secure) {
+        throw unsupported('VLESS gRPC requires TLS or REALITY');
+    }
+    if (hasNonBlankValue(proxy.flow)) {
+        if (
+            !['xtls-rprx-vision', 'xtls-rprx-vision-udp443'].includes(
+                proxy.flow,
+            ) ||
+            network !== 'tcp' ||
+            !secure
+        ) {
+            throw unsupported(
+                `VLESS flow ${proxy.flow} requires TCP with TLS or REALITY`,
+            );
+        }
+        result.append(`,flow=${proxy.flow}`);
+    }
+    if (reality) {
+        result.append(`,reality-public-key=${reality['public-key']}`);
+        result.appendIfPresent(
+            `,reality-short-id=${reality['short-id']}`,
+            'reality-opts.short-id',
+        );
+    }
+    if (network === 'grpc') {
+        const grpc = proxy['grpc-opts'] || {};
+        const mode = grpc['_grpc-type'];
+        if (hasNonBlankValue(mode) && !['gun', 'multi'].includes(mode)) {
+            throw unsupported(`VLESS gRPC mode ${mode} is unsupported`);
+        }
+        result.append(',grpc=true');
+        result.appendIfPresent(
+            `,grpc-service-name=${quoteSurgeValue(grpc['grpc-service-name'])}`,
+            'grpc-opts.grpc-service-name',
+        );
+        if (hasNonBlankValue(mode)) result.append(`,grpc-mode=${mode}`);
+        result.appendIfPresent(
+            `,grpc-authority=${quoteSurgeValue(grpc['_grpc-authority'])}`,
+            'grpc-opts._grpc-authority',
+        );
+    }
 }
 
 function handleTransport(result, proxy, includeUnsupportedProxy) {

@@ -221,9 +221,9 @@ describe('download routes', function () {
         ({ default: $ } = require('@/core/app'));
         openApi = require('@/vendor/open-api');
         ({ default: registerDownloadRoutes } = require('@/restful/download'));
-        ({ default: registerSubscriptionRoutes } = require(
-            '@/restful/subscriptions'
-        ));
+        ({
+            default: registerSubscriptionRoutes,
+        } = require('@/restful/subscriptions'));
         ageUtils = require('@/utils/age');
 
         originalRead = $.read.bind($);
@@ -404,9 +404,7 @@ describe('download routes', function () {
                 });
 
                 expect(res.statusCode).to.equal(200);
-                expect(requestedUrls).to.deep.equal([
-                    sourceUrl.split('#')[0],
-                ]);
+                expect(requestedUrls).to.deep.equal([sourceUrl.split('#')[0]]);
             }
         } finally {
             openApi.HTTP = originalHTTP;
@@ -579,7 +577,24 @@ describe('download routes', function () {
         );
     });
 
-    it('keeps SurgeMac Mihomo external output unmerged by default', async function () {
+    for (const target of ['Surge', 'SurgeMac']) {
+        it(`downloads VLESS subscriptions as native ${target} policies`, async function () {
+            const res = await requestDownloadSubscription({ target });
+
+            expect(res.statusCode).to.equal(200);
+            expect(res.sent).to.include(
+                `VLESS WS=vless,1.1.1.1,443,username=${UUID}`,
+            );
+            expect(res.sent).to.include(',ws=true,ws-path=/ws');
+            expect(res.sent).to.not.include('=external');
+        });
+    }
+
+    it('keeps unsupported SurgeMac Mihomo external output unmerged by default', async function () {
+        state[SUBS_KEY][0].content = VLESS_WS.replace(
+            'type=ws',
+            'type=httpupgrade',
+        );
         const output = await downloadSubscription({ target: 'SurgeMac' });
 
         expect(output).to.include(
@@ -590,6 +605,10 @@ describe('download routes', function () {
     });
 
     it('enables merged Mihomo external output when the query parameter is present', async function () {
+        state[SUBS_KEY][0].content = VLESS_WS.replace(
+            'type=ws',
+            'type=httpupgrade',
+        );
         const output = await downloadSubscription({
             target: 'SurgeMac',
             mihomoMerge: 'true',
@@ -606,6 +625,10 @@ describe('download routes', function () {
     });
 
     it('treats mihomoMerge=false as enabled because query flags are presence-based', async function () {
+        state[SUBS_KEY][0].content = VLESS_WS.replace(
+            'type=ws',
+            'type=httpupgrade',
+        );
         const output = await downloadSubscription({
             target: 'SurgeMac',
             mihomoMerge: 'false',
@@ -636,6 +659,10 @@ describe('download routes', function () {
     });
 
     it('enables merged Mihomo external output for collection downloads', async function () {
+        state[SUBS_KEY][0].content = VLESS_WS.replace(
+            'type=ws',
+            'type=httpupgrade',
+        );
         const output = await downloadCollection({
             target: 'SurgeMac',
             mihomoMerge: 'true',
@@ -1037,5 +1064,4 @@ describe('download routes', function () {
         expect(decrypted).to.include('VLESS WS');
         await expectDecryptFailure(res.sent, sourcePair['age-secret-key']);
     });
-
 });

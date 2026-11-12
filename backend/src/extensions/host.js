@@ -10,6 +10,10 @@ import {
     createResourceBroker,
     setDefaultResourceBroker,
 } from './resource-broker';
+import {
+    disposeExtensionScheduler,
+    extensionSchedulerAvailable,
+} from './scheduler';
 
 /**
  * Initialize the data-only Host layer. Business extensions can continue to
@@ -23,7 +27,12 @@ export function initializeExtensionHost(options = {}) {
         ...options,
         hostCapabilities:
             options.hostCapabilities ||
-            extensionHostCapabilities({ resourceBroker: hasResourceBroker }),
+            extensionHostCapabilities({
+                resourceBroker: hasResourceBroker,
+                // CronJob exists only on Node; script runtimes schedule through
+                // their own cron configuration.
+                scheduler: extensionSchedulerAvailable(),
+            }),
     });
     const referenceIndex = createExtensionReferenceIndex({
         store: manager.store,
@@ -52,6 +61,7 @@ export function initializeExtensionHost(options = {}) {
                 manifest: context?.manifest || contribution.manifest,
             }),
         unregisterContribution: unregisterExtension,
+        disposeExtension: disposeExtensionScheduler,
     });
     // Register manifests even when a product slice did not import a concrete
     // extension implementation. This makes runtime/catalog state explicit.
