@@ -396,10 +396,25 @@ vmess = tag equals "vmess" address (vmess_uuid/vmess_aead/ws/ws_path/ws_headers/
     handleWebsocket();
     handleShadowTLS();
 }
-vless = tag equals "vless" address (vless_uuid/vless_flow/vless_encryption/reality_public_key/reality_short_id/vless_ws/ws_path/ws_headers/grpc/grpc_service_name/grpc_mode/grpc_authority/tls/sni/cert_verify_name/alpn/tls_fingerprint/tls_verification/client_cert/ip_version/underlying_proxy/tos/allow_other_interface/interface/test_url/test_udp/test_timeout/hybrid/no_error_alert/fast_open/tfo/udp_relay/block_quic/others)* {
+vless = tag equals "vless" address (vless_uuid/vless_username/vless_security/vless_transport/vless_fingerprint/vless_packet_encoding/vless_flow/vless_encryption/reality_public_key/reality_short_id/vless_ws/ws_path/ws_headers/grpc/grpc_service_name/grpc_mode/grpc_authority/tls/sni/cert_verify_name/alpn/tls_fingerprint/tls_verification/client_cert/ip_version/underlying_proxy/tos/allow_other_interface/interface/test_url/test_udp/test_timeout/hybrid/no_error_alert/fast_open/tfo/udp_relay/block_quic/others)* {
     proxy.type = "vless";
+    proxy.server = stripQuotes(proxy.server);
+    if ($.vlessUuid != null) proxy.uuid = $.vlessUuid;
+    proxy.network = $.vlessTransport != null
+        ? ($.vlessTransport === "raw" ? "tcp" : $.vlessTransport)
+        : ($.grpc ? "grpc" : obfs.type === "ws" ? "ws" : "tcp");
+    obfs.type = proxy.network === "ws" ? "ws" : undefined;
     handleWebsocket();
-    if ($.grpc) proxy.network = "grpc";
+    if ($.vlessSecurity != null) {
+        if (["none", "tls", "reality"].includes($.vlessSecurity)) {
+            proxy.tls = $.vlessSecurity !== "none";
+            if ($.vlessSecurity === "reality" && !proxy['reality-opts']?.['public-key']) {
+                $set(proxy, "reality-opts.public-key", "");
+            }
+        } else {
+            proxy.security = $.vlessSecurity;
+        }
+    }
     if (proxy['reality-opts'] && proxy['reality-opts']['public-key']) proxy.tls = true;
 }
 trojan = tag equals "trojan" address (passwordk/ws/ws_path/ws_headers/tls/sni/cert_verify_name/alpn/tls_fingerprint/tls_verification/client_cert/ip_version/underlying_proxy/tos/allow_other_interface/interface/test_url/test_udp/test_timeout/hybrid/no_error_alert/fast_open/tfo/udp_relay/shadow_tls_version/shadow_tls_sni/shadow_tls_password/block_quic/others)* {
@@ -564,7 +579,12 @@ usernamek = comma "username" equals match:[^,]+ { proxy.username = match.join(""
 passwordk = comma "password" equals match:[^,]+ { proxy.password = match.join("").replace(/^"(.*?)"$/, '$1').replace(/^'(.*?)'$/, '$1'); }
 vmess_uuid = comma "username" equals match:[^,]+ { proxy.uuid = match.join(""); }
 vmess_aead = comma "vmess-aead" equals flag:bool { proxy.aead = flag; }
-vless_uuid = comma "username" equals value:quoted_value { proxy.uuid = value.trim(); }
+vless_uuid = comma "uuid" equals value:quoted_value { $.vlessUuid = value.trim(); }
+vless_username = comma "username" equals value:quoted_value { proxy.uuid = value.trim(); }
+vless_security = comma "security" equals value:quoted_value { $.vlessSecurity = value.trim(); }
+vless_transport = comma "transport" equals value:quoted_value { $.vlessTransport = value.trim(); }
+vless_fingerprint = comma ("fingerprint"/"client-fingerprint") equals value:quoted_value { proxy['client-fingerprint'] = value.trim(); }
+vless_packet_encoding = comma "packet-encoding" equals value:quoted_value { proxy['packet-encoding'] = value.trim() === "none" ? "" : value.trim(); }
 vless_flow = comma "flow" equals value:quoted_value { proxy.flow = value.trim(); }
 vless_encryption = comma "encryption" equals value:quoted_value { proxy.encryption = value.trim(); }
 reality_public_key = comma "reality-public-key" equals value:quoted_value { $set(proxy, "reality-opts.public-key", value.trim()); }

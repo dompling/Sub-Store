@@ -621,15 +621,12 @@ function h2Connect(proxy) {
 function vmessOrVless(proxy, includeUnsupportedProxy) {
     const isVless = proxy.type === 'vless';
     const result = new Result(proxy);
-    result.append(`${proxy.name}=${proxy.type},${proxy.server},${proxy.port}`);
-    const username =
-        isVless && /[,\s]/.test(proxy.uuid)
-            ? quoteSurgeValue(proxy.uuid)
-            : proxy.uuid;
-    result.appendIfPresent(`,username=${username}`, 'uuid');
+    const server = isVless ? quoteSurgeValue(proxy.server) : proxy.server;
+    result.append(`${proxy.name}=${proxy.type},${server},${proxy.port}`);
     if (isVless) {
         appendVlessParams(result, proxy);
     } else {
+        result.appendIfPresent(`,username=${proxy.uuid}`, 'uuid');
         const encryptMethod = formatSurgeVmessEncryptMethod(proxy.cipher);
         if (encryptMethod) {
             result.append(`,encrypt-method=${encryptMethod}`);
@@ -659,7 +656,7 @@ function vmessOrVless(proxy, includeUnsupportedProxy) {
     }
 
     // tls
-    result.appendIfPresent(`,tls=${proxy.tls}`, 'tls');
+    if (!isVless) result.appendIfPresent(`,tls=${proxy.tls}`, 'tls');
 
     // tls verification
     appendTlsProxyParams(
@@ -1341,7 +1338,9 @@ function hysteria2(proxy) {
 }
 
 function appendVlessParams(result, proxy) {
-    // https://manual.nssurge.com/policies/vless.html
+    if (!hasNonBlankValue(proxy.uuid)) {
+        throw unsupported('VLESS uuid is required');
+    }
     if (hasNonBlankValue(proxy._finalmask)) {
         // Neither native Surge nor the Mihomo fallback can preserve this mask.
         throw new Error('VLESS finalmask cannot be represented on Surge');
@@ -1349,6 +1348,13 @@ function appendVlessParams(result, proxy) {
     const network = proxy.network === 'raw' ? 'tcp' : proxy.network || 'tcp';
     const reality = proxy['reality-opts'];
     const secure = proxy.tls || reality;
+    if (
+        hasNonBlankValue(proxy.security) &&
+        !['none', 'tls', 'reality'].includes(proxy.security)
+    ) {
+        // Mihomo cannot preserve an unknown security mode either.
+        throw new Error(`VLESS security ${proxy.security} is unsupported`);
+    }
     if (!['tcp', 'ws', 'grpc'].includes(network)) {
         throw unsupported(`VLESS network ${network} is unsupported`);
     }
@@ -1361,6 +1367,12 @@ function appendVlessParams(result, proxy) {
     if (network === 'grpc' && !secure) {
         throw unsupported('VLESS gRPC requires TLS or REALITY');
     }
+    result.append(',encryption="none"');
+    result.append(
+        `,fingerprint=${quoteSurgeValue(
+            getIfNotBlank(proxy['client-fingerprint']) || 'chrome',
+        )}`,
+    );
     if (hasNonBlankValue(proxy.flow)) {
         if (
             !['xtls-rprx-vision', 'xtls-rprx-vision-udp443'].includes(
@@ -1373,27 +1385,41 @@ function appendVlessParams(result, proxy) {
                 `VLESS flow ${proxy.flow} requires TCP with TLS or REALITY`,
             );
         }
-        result.append(`,flow=${proxy.flow}`);
+        result.append(`,flow=${quoteSurgeValue(proxy.flow)}`);
     }
+    const packetEncoding = proxy['packet-encoding'] ?? 'auto';
+    result.append(
+        `,packet-encoding=${quoteSurgeValue(
+            packetEncoding === '' ? 'none' : packetEncoding,
+        )}`,
+    );
     if (reality) {
-        result.append(`,reality-public-key=${reality['public-key']}`);
+        result.append(
+            `,reality-public-key=${quoteSurgeValue(reality['public-key'])}`,
+        );
         result.appendIfPresent(
-            `,reality-short-id=${reality['short-id']}`,
+            `,reality-short-id=${quoteSurgeValue(reality['short-id'])}`,
             'reality-opts.short-id',
         );
     }
+    result.append(
+        `,security="${reality ? 'reality' : proxy.tls ? 'tls' : 'none'}"`,
+    );
+    result.append(`,transport=${quoteSurgeValue(network)}`);
+    result.appendIfPresent(`,uuid=${quoteSurgeValue(proxy.uuid)}`, 'uuid');
     if (network === 'grpc') {
         const grpc = proxy['grpc-opts'] || {};
         const mode = grpc['_grpc-type'];
         if (hasNonBlankValue(mode) && !['gun', 'multi'].includes(mode)) {
             throw unsupported(`VLESS gRPC mode ${mode} is unsupported`);
         }
-        result.append(',grpc=true');
         result.appendIfPresent(
             `,grpc-service-name=${quoteSurgeValue(grpc['grpc-service-name'])}`,
             'grpc-opts.grpc-service-name',
         );
-        if (hasNonBlankValue(mode)) result.append(`,grpc-mode=${mode}`);
+        if (hasNonBlankValue(mode)) {
+            result.append(`,grpc-mode=${quoteSurgeValue(mode)}`);
+        }
         result.appendIfPresent(
             `,grpc-authority=${quoteSurgeValue(grpc['_grpc-authority'])}`,
             'grpc-opts._grpc-authority',
@@ -1404,12 +1430,13 @@ function appendVlessParams(result, proxy) {
 function handleTransport(result, proxy, includeUnsupportedProxy) {
     if (isPresent(proxy, 'network')) {
         if (proxy.network === 'ws') {
-            result.append(`,ws=true`);
+            if (proxy.type !== 'vless') result.append(`,ws=true`);
             if (isPresent(proxy, 'ws-opts')) {
-                result.appendIfPresent(
-                    `,ws-path=${proxy['ws-opts'].path}`,
-                    'ws-opts.path',
-                );
+                const path =
+                    proxy.type === 'vless'
+                        ? quoteSurgeValue(proxy['ws-opts'].path)
+                        : proxy['ws-opts'].path;
+                result.appendIfPresent(`,ws-path=${path}`, 'ws-opts.path');
                 if (isPresent(proxy, 'ws-opts.headers')) {
                     const headers = proxy['ws-opts'].headers;
                     const value = formatHeaderMap(headers, '|');

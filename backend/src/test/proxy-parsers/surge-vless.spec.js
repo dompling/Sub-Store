@@ -5,6 +5,146 @@ import { ProxyUtils } from '@/core/proxy-utils';
 import { UUID, expectSubset, parseAll, parseOne } from './helpers';
 
 describe('Surge VLESS parser', function () {
+    it('parses the working uuid/security/transport REALITY syntax', function () {
+        const proxy = parseOne(
+            `Native=vless,"host.example.com",443,encryption="none",fingerprint="chrome",flow="xtls-rprx-vision",packet-encoding="auto",reality-public-key="public-key",reality-short-id="abcd",security="reality",sni="sni.example.com",transport="tcp",uuid="${UUID}"`,
+        );
+
+        expectSubset(proxy, {
+            type: 'vless',
+            server: 'host.example.com',
+            port: 443,
+            uuid: UUID,
+            encryption: 'none',
+            'client-fingerprint': 'chrome',
+            flow: 'xtls-rprx-vision',
+            'packet-encoding': 'auto',
+            network: 'tcp',
+            tls: true,
+            sni: 'sni.example.com',
+            'reality-opts': { 'public-key': 'public-key', 'short-id': 'abcd' },
+        });
+    });
+
+    for (const options of [
+        `username=legacy-user,uuid='${UUID}'`,
+        `uuid='${UUID}',username=legacy-user`,
+    ]) {
+        it(`prefers uuid over username with ${options}`, function () {
+            const proxy = parseOne(
+                `Native=vless,host.example.com,443,${options}`,
+            );
+            expect(proxy.uuid).to.equal(UUID);
+        });
+    }
+
+    for (const [security, tls] of [
+        ['none', false],
+        ['tls', true],
+    ]) {
+        it(`maps security=${security} independently of legacy tls option order`, function () {
+            for (const options of [
+                `security=${security},tls=${!tls}`,
+                `tls=${!tls},security=${security}`,
+            ]) {
+                const proxy = parseOne(
+                    `Native=vless,host.example.com,443,uuid=${UUID},${options}`,
+                );
+                expect(proxy.tls).to.equal(tls);
+                expect(proxy).not.to.have.property('reality-opts');
+            }
+        });
+    }
+
+    it('keeps REALITY without a public key visible to export validation', function () {
+        const proxy = parseOne(
+            `Incomplete=vless,host.example.com,443,uuid=${UUID},security=reality,reality-short-id="",tls=false`,
+        );
+
+        expectSubset(proxy, {
+            tls: true,
+            'reality-opts': { 'public-key': '', 'short-id': '' },
+        });
+        expect(
+            ProxyUtils.produce([proxy], 'ClashMeta', 'internal'),
+        ).to.deep.equal([]);
+    });
+
+    it('still infers TLS from a public key with security=none', function () {
+        const proxy = parseOne(
+            `Native=vless,host.example.com,443,uuid=${UUID},reality-public-key=public-key,security=none`,
+        );
+        expect(proxy.tls).to.equal(true);
+    });
+
+    for (const transport of ['tcp', 'raw']) {
+        it(`normalizes transport=${transport} and ignores inactive WebSocket options`, function () {
+            const proxy = parseOne(
+                `Native=vless,'host.example.com',443,uuid=${UUID},ws=true,grpc=true,transport=${transport},ws-path=/ignored,ws-headers=Host:ignored.example.com`,
+            );
+
+            expectSubset(proxy, { network: 'tcp', server: 'host.example.com' });
+            expect(proxy).not.to.have.property('ws-opts');
+        });
+    }
+
+    for (const options of [
+        'transport=ws,ws-path=/socket,ws-headers="Host:cdn.example.com|X-Test:client"',
+        'ws-path=/socket,ws-headers="Host:cdn.example.com|X-Test:client",transport=ws',
+    ]) {
+        it(`parses transport=ws independently of option order: ${options}`, function () {
+            const proxy = parseOne(
+                `Native=vless,host.example.com,443,uuid=${UUID},security=tls,${options}`,
+            );
+
+            expectSubset(proxy, {
+                uuid: UUID,
+                network: 'ws',
+                tls: true,
+                'ws-opts': {
+                    path: '/socket',
+                    headers: { Host: 'cdn.example.com', 'X-Test': 'client' },
+                },
+            });
+        });
+    }
+
+    it('preserves gRPC options with transport=grpc', function () {
+        const proxy = parseOne(
+            `Native=vless,host.example.com,443,uuid=${UUID},grpc-service-name=/service,transport=grpc,grpc-mode=multi,grpc-authority=authority.example.com,security=tls`,
+        );
+
+        expectSubset(proxy, {
+            uuid: UUID,
+            network: 'grpc',
+            tls: true,
+            'grpc-opts': {
+                'grpc-service-name': '/service',
+                '_grpc-type': 'multi',
+                '_grpc-authority': 'authority.example.com',
+            },
+        });
+    });
+
+    it('preserves unsupported transport and security for downstream validation', function () {
+        const proxy = parseOne(
+            `Unsupported=vless,host.example.com,443,uuid=${UUID},transport=xhttp,security=xtls`,
+        );
+
+        expectSubset(proxy, { network: 'xhttp', security: 'xtls' });
+    });
+
+    for (const encoding of ['auto', 'xudp', 'packetaddr', 'none', 'future']) {
+        it(`preserves packet-encoding=${encoding}`, function () {
+            const proxy = parseOne(
+                `Native=vless,host.example.com,443,uuid=${UUID},packet-encoding="${encoding}"`,
+            );
+            expect(proxy['packet-encoding']).to.equal(
+                encoding === 'none' ? '' : encoding,
+            );
+        });
+    }
+
     it('parses REALITY and Vision from native Surge subscriptions', function () {
         const proxy = parseOne(
             `Proxy-REALITY = vless, 1.2.3.4, 443, username=${UUID}, flow=xtls-rprx-vision, sni=www.microsoft.com, reality-public-key=dwrjY6KiAMPxKdlF7T4AWFXXBtsxeHCXtBQYeCOdZV4, reality-short-id=0123456789abcdef`,
