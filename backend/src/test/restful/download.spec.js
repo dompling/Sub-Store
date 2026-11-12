@@ -582,13 +582,29 @@ describe('download routes', function () {
             const res = await requestDownloadSubscription({ target });
 
             expect(res.statusCode).to.equal(200);
-            expect(res.sent).to.include('VLESS WS=vless,"1.1.1.1",443,');
-            expect(res.sent).to.include(`,uuid="${UUID}"`);
-            expect(res.sent).to.include(',security="tls"');
-            expect(res.sent).to.include(',transport="ws"');
+            if (target === 'SurgeMac') {
+                expect(res.sent).to.include('VLESS WS=vless,"1.1.1.1",443,');
+                expect(res.sent).to.include(`,uuid="${UUID}"`);
+                expect(res.sent).to.include(',security="tls"');
+                expect(res.sent).to.include(',transport="ws"');
+                expect(res.sent).to.not.include(',username=');
+                expect(res.sent).to.not.include(',tls=');
+            } else {
+                expect(res.sent).to.include('VLESS WS=vless,1.1.1.1,443,');
+                expect(res.sent).to.include(`,username="${UUID}"`);
+                expect(res.sent).to.include(',tls=true');
+                expect(res.sent).to.include(',ws=true');
+                for (const field of [
+                    'uuid',
+                    'security',
+                    'transport',
+                    'fingerprint',
+                    'packet-encoding',
+                ]) {
+                    expect(res.sent).to.not.include(`,${field}=`);
+                }
+            }
             expect(res.sent).to.include(',ws-path="/ws"');
-            expect(res.sent).to.not.include(',username=');
-            expect(res.sent).to.not.include(',tls=');
             expect(res.sent).to.not.include('=external');
         });
     }
