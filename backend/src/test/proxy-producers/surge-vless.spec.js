@@ -13,7 +13,7 @@ const base = {
 };
 
 describe('Surge VLESS producer', function () {
-    for (const target of ['Surge', 'surge']) {
+    for (const target of ['Surge', 'surge', 'SurgeMac']) {
         it(`exports the official REALITY policy syntax for ${target}`, function () {
             const input = `Proxy-REALITY = vless, 1.2.3.4, 443, username=${UUID}, flow=xtls-rprx-vision, sni=www.microsoft.com, reality-public-key=dwrjY6KiAMPxKdlF7T4AWFXXBtsxeHCXtBQYeCOdZV4, reality-short-id=0123456789abcdef`;
             const proxies = ProxyUtils.parse(input);
@@ -81,9 +81,7 @@ describe('Surge VLESS producer', function () {
                 },
             });
             expect(output).to.equal(
-                target === 'SurgeMac'
-                    ? `VLESS=vless,"vless.example.com",443,encryption="none",fingerprint="chrome",flow="xtls-rprx-vision",packet-encoding="auto",reality-public-key="public-key",reality-short-id="abcd",security="reality",transport="tcp",uuid="${UUID}",sni="sni.example.com"`
-                    : `VLESS=vless,vless.example.com,443,encryption="none",flow="xtls-rprx-vision",reality-public-key="public-key",reality-short-id="abcd",username="${UUID}",sni="sni.example.com"`,
+                `VLESS=vless,vless.example.com,443,encryption="none",flow="xtls-rprx-vision",reality-public-key="public-key",reality-short-id="abcd",username="${UUID}",sni="sni.example.com"`,
             );
         });
     }
@@ -109,7 +107,8 @@ describe('Surge VLESS producer', function () {
     });
 
     for (const [label, fields, parameters] of [
-        ['TLS', { tls: true }, 'security="tls",transport="tcp"'],
+        ['TCP', {}, ''],
+        ['TLS', { tls: true }, ',tls=true'],
         [
             'WebSocket',
             {
@@ -120,7 +119,7 @@ describe('Surge VLESS producer', function () {
                     headers: { Host: 'cdn.example.com' },
                 },
             },
-            'security="tls",transport="ws"',
+            ',ws=true,ws-path="/ws",ws-headers="Host:"cdn.example.com"",tls=true',
         ],
         [
             'gRPC',
@@ -129,31 +128,27 @@ describe('Surge VLESS producer', function () {
                 tls: true,
                 'grpc-opts': { 'grpc-service-name': 'service' },
             },
-            'security="tls",transport="grpc"',
+            ',grpc=true,grpc-service-name="service",tls=true',
         ],
     ]) {
-        it(`preserves the existing Surge Mac ${label} output`, function () {
-            const output = produceExternal('SurgeMac', { ...base, ...fields });
-            const suffix =
-                label === 'WebSocket'
-                    ? ',ws-path="/ws",ws-headers="Host:"cdn.example.com""'
-                    : label === 'gRPC'
-                    ? ',grpc-service-name="service"'
-                    : '';
+        it(`uses the mobile ${label} format on Surge Mac`, function () {
+            const proxy = { ...base, ...fields };
+            const output = produceExternal('SurgeMac', proxy);
             expect(output).to.equal(
-                `VLESS=vless,"vless.example.com",443,encryption="none",fingerprint="chrome",packet-encoding="auto",${parameters},uuid="${UUID}"${suffix}`,
+                `VLESS=vless,vless.example.com,443,encryption="none",username="${UUID}"${parameters}`,
             );
+            expect(output).to.equal(produceExternal('Surge', proxy));
         });
     }
 
-    it('preserves Surge Mac fingerprint and disabled UDP packet encoding', function () {
+    it('omits fingerprint and disabled UDP packet encoding on Surge Mac', function () {
         const output = produceExternal('SurgeMac', {
             ...base,
             'client-fingerprint': 'firefox',
             'packet-encoding': '',
         });
-        expect(output).to.include(',fingerprint="firefox"');
-        expect(output).to.include(',packet-encoding="none"');
+        expect(output).to.not.include(',fingerprint=');
+        expect(output).to.not.include(',packet-encoding=');
     });
 
     for (const platform of ['Surge', 'SurgeMac']) {
@@ -215,9 +210,7 @@ describe('Surge VLESS producer', function () {
                 useMihomoExternal: true,
             });
             expect(output).to.equal(
-                platform === 'SurgeMac'
-                    ? `VLESS=vless,"vless.example.com",443,encryption="none",fingerprint="chrome",packet-encoding="auto",security="none",transport="tcp",uuid="${UUID}"`
-                    : `VLESS=vless,vless.example.com,443,encryption="none",username="${UUID}"`,
+                `VLESS=vless,vless.example.com,443,encryption="none",username="${UUID}"`,
             );
         });
     }

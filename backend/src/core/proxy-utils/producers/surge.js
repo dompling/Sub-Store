@@ -161,8 +161,8 @@ function isUnsupportedSnellV6Obfs(proxy) {
     return Number(proxy.version) === 6 && hasSnellObfs(proxy);
 }
 
-export default function Surge_Producer({ vlessFormat = 'mac' } = {}) {
-    // SurgeMac uses the default instance; only the iOS registry selects its format.
+export default function Surge_Producer({ vlessFormat = 'ios' } = {}) {
+    // Surge iOS and SurgeMac share the mobile VLESS format.
     const produce = (proxy, type, opts = {}) => {
         if (
             ['ws'].includes(proxy.network) &&
